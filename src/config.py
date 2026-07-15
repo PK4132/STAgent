@@ -22,7 +22,7 @@ class AppConfig:
     # Data paths
     data_path: str = str(DATA_DIR / "pancreas_processed_full.h5ad")
     plot_dir: str = str(BASE_DIR / "tmp" / "plots")
-    db_path: str = str(DB_DIR / "chroma_squidpy_db")
+    combined_db_path: str = str(DB_DIR / "chroma_combined_db")
     
     # History directories
     history_dirs: Dict[str, str] = None
@@ -103,6 +103,13 @@ class AppConfig:
                         "temperature": 0,
                         "convert_system_message_to_human": True
                     }
+                },
+                "lm_studio": {
+                    "gemma4-e2b": {
+                        "temperature": 0,
+                        "base_url": "http://localhost:1234/v1",
+                        "api_key": "lm-studio"
+                    }
                 }
             }
         
@@ -113,7 +120,7 @@ class AppConfig:
         """Ensure all required directories exist."""
         directories = [
             self.plot_dir,
-            self.db_path
+            self.combined_db_path
         ]
         
         # Add history directories
@@ -253,8 +260,8 @@ def get_plot_dir() -> str:
 
 
 def get_db_path() -> str:
-    """Get the database path."""
-    return app_config.db_path
+    """Get the combined RAG database path."""
+    return app_config.combined_db_path
 
 
 # Environment-specific overrides
@@ -273,7 +280,7 @@ def load_environment_config():
     # Override database path if specified
     env_db_path = os.getenv("STAGENT_DB_PATH")
     if env_db_path:
-        app_config.db_path = env_db_path
+        app_config.combined_db_path = env_db_path
     
     # Override recursion limit if specified
     env_recursion_limit = os.getenv("STAGENT_RECURSION_LIMIT")

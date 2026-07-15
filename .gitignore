@@ -13,7 +13,9 @@ conversation_histories_*/
 research_reports/
 output_report/
 db/chroma_squidpy_db/
+db/chroma_combined_db/
 src/db/chroma_squidpy_db/
+src/db/chroma_combined_db/
 src/tmp/
 
 # Local outputs and datasets
