@@ -120,10 +120,10 @@ specific targeted analyses to comprehensive multi-step pipelines.
   </tool>
 
   <tool name="squidpy_rag_agent">
-    - Purpose: Retrieve Squidpy code examples and API documentation via RAG over codebase
-    - Index: db/chroma_squidpy_db (OpenAI embeddings; requires OPENAI_API_KEY)
-    - Note: First run indexes the repo; subsequent queries are fast
-    - When: Use when you need Squidpy-specific code patterns or API guidance
+    - Purpose: Retrieve Squidpy and SpatialData code examples and API documentation via RAG over codebases
+    - Index: db/chroma_combined_db (LM Studio local embeddings; requires gemma4-e2b + embedding model loaded)
+    - Note: First run indexes both repos; subsequent queries are fast
+    - When: Use when you need Squidpy or SpatialData code patterns or API guidance
   </tool>
 
   <tool name="visualize_umap">
