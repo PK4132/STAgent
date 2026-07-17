@@ -110,6 +110,13 @@ def _code_requires_data(code: str) -> bool:
     return any(hint in code for hint in _DATA_HINTS)
 
 
+def _prepare_code_for_execution(code: str, data_path: str) -> str:
+    """Prepend a trusted DATA_PATH so the LLM never needs to copy Windows paths."""
+    if not data_path:
+        return code
+    return f"DATA_PATH = {data_path!r}\n{code}"
+
+
 def _get_python_repl():
     global _python_repl
     if _python_repl is None:
@@ -269,10 +276,11 @@ class SquidpyRAGTool:
             )
             if data_path:
                 data_path_instruction = (
-                    f"A data path was provided: {data_path}\n"
-                    "Use it exactly in the generated code. Examples:\n"
-                    f'- h5ad: adata = sc.read_h5ad(r"{data_path}")\n'
-                    f'- zarr: import spatialdata as sd; sdata = sd.read_zarr(r"{data_path}")\n'
+                    "A data file path will be injected as the variable DATA_PATH before your code runs.\n"
+                    "Use DATA_PATH only — do NOT hardcode any file path string in the code.\n"
+                    "Examples:\n"
+                    "- h5ad: adata = sc.read_h5ad(DATA_PATH)\n"
+                    "- zarr: import spatialdata as sd; sdata = sd.read_zarr(DATA_PATH)\n"
                     "Pick the loader appropriate for the file extension and query."
                 )
 
@@ -332,7 +340,8 @@ class SquidpyRAGTool:
 
             tool_config = get_tool_config()
             timeout = tool_config.rag_exec_timeout
-            output = _get_python_repl().run(code, timeout=timeout)
+            executable_code = _prepare_code_for_execution(code, state.get("data_path", ""))
+            output = _get_python_repl().run(executable_code, timeout=timeout)
             success = not _execution_failed(output)
 
             return {
