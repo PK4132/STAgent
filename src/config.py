@@ -213,11 +213,34 @@ class ToolConfig:
     chunk_size: int = 1000
     chunk_overlap: int = 200
     top_k_results: int = 5
+
+    # RAG execution settings
+    rag_exec_timeout: int = 30
+    rag_exec_enabled: bool = True
+    rag_max_rewrite_attempts: int = 3
     
     def __post_init__(self):
         """Initialize computed fields."""
         # Get API keys from environment
         self.serp_api_key = os.getenv("SERP_API_KEY")
+
+        rag_exec_enabled = os.getenv("RAG_EXEC_ENABLED")
+        if rag_exec_enabled is not None:
+            self.rag_exec_enabled = rag_exec_enabled.lower() == "true"
+
+        rag_exec_timeout = os.getenv("RAG_EXEC_TIMEOUT")
+        if rag_exec_timeout:
+            try:
+                self.rag_exec_timeout = int(rag_exec_timeout)
+            except ValueError:
+                pass
+
+        rag_max_rewrite = os.getenv("RAG_MAX_REWRITE_ATTEMPTS")
+        if rag_max_rewrite:
+            try:
+                self.rag_max_rewrite_attempts = int(rag_max_rewrite)
+            except ValueError:
+                pass
 
 
 # Global configuration instances
