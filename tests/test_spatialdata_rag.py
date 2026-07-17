@@ -7,7 +7,15 @@ from langchain_core.documents import Document
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from squidpy_rag import GradeDoc, SquidpyRAGTool, decide_relevance
+from squidpy_rag import (
+    GeneratedAnswer,
+    GradeDoc,
+    SquidpyRAGTool,
+    decide_execution,
+    decide_relevance,
+    _code_requires_data,
+    _execution_failed,
+)
 
 
 def _base_state(**overrides):
@@ -16,11 +24,40 @@ def _base_state(**overrides):
         "context": [],
         "filtered_context": [],
         "answer": "",
+        "generated_code": "",
+        "execution_output": "",
+        "execution_success": False,
         "chat_history": [],
         "rewrite_attempts": 0,
+        "data_path": "",
     }
     state.update(overrides)
     return state
+
+
+def _mock_tool_config(*, rag_exec_enabled=True, rag_max_rewrite_attempts=3):
+    mock_config = MagicMock()
+    mock_config.rag_exec_enabled = rag_exec_enabled
+    mock_config.rag_exec_timeout = 30
+    mock_config.rag_max_rewrite_attempts = rag_max_rewrite_attempts
+    mock_config.max_output_length = 10000
+    return mock_config
+
+
+def _setup_structured_llm(mock_llm, *, grade_results=None, generated=None):
+    mock_grader = MagicMock()
+    if grade_results is not None:
+        mock_grader.invoke.side_effect = grade_results
+    else:
+        mock_grader.invoke.return_value = GradeDoc(score="yes")
+
+    mock_generator = MagicMock()
+    mock_generator.invoke.return_value = generated or GeneratedAnswer(
+        code="print('ok')",
+        explanation="Final answer",
+    )
+    mock_llm.with_structured_output.side_effect = [mock_grader, mock_generator]
+    return mock_grader, mock_generator
 
 
 def test_decide_relevance_routes_to_generate_when_docs_present():
@@ -36,14 +73,49 @@ def test_decide_relevance_routes_to_rewrite_when_empty():
     assert decide_relevance(state) == "rewrite_query"
 
 
-def test_decide_relevance_loop_guard_at_max_rewrites():
+@patch("squidpy_rag.get_tool_config")
+def test_decide_relevance_loop_guard_at_max_rewrites(mock_get_tool_config):
+    mock_get_tool_config.return_value = _mock_tool_config(rag_max_rewrite_attempts=3)
     state = _base_state(filtered_context=[], rewrite_attempts=3)
     assert decide_relevance(state) == "generate"
 
 
+def test_decide_execution_routes_to_end_on_success():
+    state = _base_state(execution_success=True)
+    assert decide_execution(state) == "end"
+
+
+def test_decide_execution_routes_to_rewrite_on_failure():
+    state = _base_state(execution_success=False, rewrite_attempts=0)
+    assert decide_execution(state) == "rewrite_query"
+
+
+@patch("squidpy_rag.get_tool_config")
+def test_decide_execution_loop_guard_at_max_rewrites(mock_get_tool_config):
+    mock_get_tool_config.return_value = _mock_tool_config(rag_max_rewrite_attempts=3)
+    state = _base_state(execution_success=False, rewrite_attempts=3)
+    assert decide_execution(state) == "end"
+
+
+def test_execution_failed_detects_traceback():
+    assert _execution_failed("NameError('x is not defined')") is True
+    assert _execution_failed("Execution timed out") is True
+    assert _execution_failed("") is False
+    assert _execution_failed("hello world") is False
+
+
+def test_code_requires_data_heuristic():
+    assert _code_requires_data("sdata = sd.read_zarr('/path')") is True
+    assert _code_requires_data("import squidpy as sq") is False
+
+
+@patch("squidpy_rag.get_tool_config")
 @patch("squidpy_rag.SquidpyRAGTool.setup_combined_index")
 @patch("squidpy_rag.ChatOpenAI")
-def test_grade_documents_populates_filtered_context(mock_chat_openai, mock_setup_index):
+def test_grade_documents_populates_filtered_context(
+    mock_chat_openai, mock_setup_index, mock_get_tool_config
+):
+    mock_get_tool_config.return_value = _mock_tool_config()
     mock_retriever = MagicMock()
     mock_retriever.invoke.return_value = [
         Document(page_content="squidpy spatial neighbors", metadata={"source_repo": "squidpy"}),
@@ -52,13 +124,10 @@ def test_grade_documents_populates_filtered_context(mock_chat_openai, mock_setup
     mock_setup_index.return_value = mock_retriever
 
     mock_llm = MagicMock()
-    mock_grader = MagicMock()
-    mock_grader.invoke.side_effect = [
-        GradeDoc(score="yes"),
-        GradeDoc(score="no"),
-    ]
-    mock_llm.with_structured_output.return_value = mock_grader
-    mock_llm.invoke.return_value = MagicMock(content="Generated answer")
+    _setup_structured_llm(
+        mock_llm,
+        grade_results=[GradeDoc(score="yes"), GradeDoc(score="no")],
+    )
     mock_chat_openai.return_value = mock_llm
 
     tool = SquidpyRAGTool()
@@ -71,9 +140,108 @@ def test_grade_documents_populates_filtered_context(mock_chat_openai, mock_setup
     assert result["filtered_context"][0].metadata["source_repo"] == "squidpy"
 
 
+@patch("squidpy_rag.get_tool_config")
 @patch("squidpy_rag.SquidpyRAGTool.setup_combined_index")
 @patch("squidpy_rag.ChatOpenAI")
-def test_rewrite_loop_guard_fires_at_max_attempts(mock_chat_openai, mock_setup_index):
+def test_generate_structured_output(
+    mock_chat_openai, mock_setup_index, mock_get_tool_config
+):
+    mock_get_tool_config.return_value = _mock_tool_config(rag_exec_enabled=False)
+    mock_retriever = MagicMock()
+    mock_retriever.invoke.return_value = [
+        Document(page_content="spatial neighbors", metadata={"source_repo": "squidpy"}),
+    ]
+    mock_setup_index.return_value = mock_retriever
+
+    mock_llm = MagicMock()
+    _setup_structured_llm(
+        mock_llm,
+        generated=GeneratedAnswer(code="import squidpy", explanation="Use squidpy"),
+    )
+    mock_chat_openai.return_value = mock_llm
+
+    tool = SquidpyRAGTool()
+    result = tool.rag_pipeline.invoke(_base_state())
+
+    assert result["answer"] == "Use squidpy"
+    assert result["generated_code"] == "import squidpy"
+
+
+@patch("squidpy_rag.get_tool_config")
+@patch("squidpy_rag._get_python_repl")
+@patch("squidpy_rag.SquidpyRAGTool.setup_combined_index")
+@patch("squidpy_rag.ChatOpenAI")
+def test_execute_node_calls_repl(
+    mock_chat_openai, mock_setup_index, mock_get_repl, mock_get_tool_config
+):
+    mock_get_tool_config.return_value = _mock_tool_config(rag_exec_enabled=True)
+    mock_retriever = MagicMock()
+    mock_retriever.invoke.return_value = [
+        Document(page_content="version info", metadata={"source_repo": "squidpy"}),
+    ]
+    mock_setup_index.return_value = mock_retriever
+
+    mock_repl = MagicMock()
+    mock_repl.run.return_value = "1.6.0"
+    mock_get_repl.return_value = mock_repl
+
+    mock_llm = MagicMock()
+    _setup_structured_llm(
+        mock_llm,
+        generated=GeneratedAnswer(code="import squidpy; print(squidpy.__version__)", explanation="Print version"),
+    )
+    mock_chat_openai.return_value = mock_llm
+
+    tool = SquidpyRAGTool()
+    result = tool.rag_pipeline.invoke(_base_state())
+
+    mock_repl.run.assert_called_once_with("import squidpy; print(squidpy.__version__)", timeout=30)
+    assert result["execution_success"] is True
+    assert result["execution_output"] == "1.6.0"
+
+
+@patch("squidpy_rag.get_tool_config")
+@patch("squidpy_rag._get_python_repl")
+@patch("squidpy_rag.SquidpyRAGTool.setup_combined_index")
+@patch("squidpy_rag.ChatOpenAI")
+def test_execute_skips_when_no_data_path(
+    mock_chat_openai, mock_setup_index, mock_get_repl, mock_get_tool_config
+):
+    mock_get_tool_config.return_value = _mock_tool_config(rag_exec_enabled=True)
+    mock_retriever = MagicMock()
+    mock_retriever.invoke.return_value = [
+        Document(page_content="read zarr", metadata={"source_repo": "spatialdata"}),
+    ]
+    mock_setup_index.return_value = mock_retriever
+
+    mock_repl = MagicMock()
+    mock_get_repl.return_value = mock_repl
+
+    mock_llm = MagicMock()
+    _setup_structured_llm(
+        mock_llm,
+        generated=GeneratedAnswer(
+            code="import spatialdata as sd; sd.read_zarr('/tmp/data.zarr')",
+            explanation="Load zarr",
+        ),
+    )
+    mock_chat_openai.return_value = mock_llm
+
+    tool = SquidpyRAGTool()
+    result = tool.rag_pipeline.invoke(_base_state(data_path=""))
+
+    mock_repl.run.assert_not_called()
+    assert result["execution_success"] is False
+    assert "Execution skipped" in result["execution_output"]
+
+
+@patch("squidpy_rag.get_tool_config")
+@patch("squidpy_rag.SquidpyRAGTool.setup_combined_index")
+@patch("squidpy_rag.ChatOpenAI")
+def test_rewrite_loop_guard_fires_at_max_attempts(
+    mock_chat_openai, mock_setup_index, mock_get_tool_config
+):
+    mock_get_tool_config.return_value = _mock_tool_config(rag_exec_enabled=False)
     mock_retriever = MagicMock()
     mock_retriever.invoke.return_value = [
         Document(page_content="irrelevant", metadata={"source_repo": "squidpy"}),
@@ -83,14 +251,16 @@ def test_rewrite_loop_guard_fires_at_max_attempts(mock_chat_openai, mock_setup_i
     mock_llm = MagicMock()
     mock_grader = MagicMock()
     mock_grader.invoke.return_value = GradeDoc(score="no")
+    mock_generator = MagicMock()
+    mock_generator.invoke.return_value = GeneratedAnswer(code="", explanation="Final answer")
+    mock_llm.with_structured_output.side_effect = [mock_grader, mock_generator]
 
     rewrite_responses = [
         MagicMock(content="rewritten query 1"),
         MagicMock(content="rewritten query 2"),
         MagicMock(content="rewritten query 3"),
     ]
-    mock_llm.with_structured_output.return_value = mock_grader
-    mock_llm.invoke.side_effect = rewrite_responses + [MagicMock(content="Final answer")]
+    mock_llm.invoke.side_effect = rewrite_responses
     mock_chat_openai.return_value = mock_llm
 
     tool = SquidpyRAGTool()
