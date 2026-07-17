@@ -120,10 +120,11 @@ specific targeted analyses to comprehensive multi-step pipelines.
   </tool>
 
   <tool name="squidpy_rag_agent">
-    - Purpose: Retrieve Squidpy and SpatialData code examples and API documentation via RAG over codebases
+    - Purpose: Retrieve Squidpy/SpatialData code via RAG, generate an answer, and execute the code
     - Index: db/chroma_combined_db (LM Studio local embeddings; requires gemma4-e2b + embedding model loaded)
-    - Note: First run indexes both repos; subsequent queries are fast
-    - When: Use when you need Squidpy or SpatialData code patterns or API guidance
+    - Optional: pass data_path for code that reads h5ad or zarr spatial datasets
+    - Output: explanation + generated code + execution stdout (or error if execution fails)
+    - When: Use when you need Squidpy or SpatialData code patterns or API guidance; pass data_path when code needs real data
   </tool>
 
   <tool name="visualize_umap">
