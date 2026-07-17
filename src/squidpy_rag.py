@@ -18,6 +18,7 @@ from langchain_core.messages import AnyMessage
 from langchain_core.tools import tool
 from langgraph.prebuilt import InjectedState
 from prompt import spatial_processing_prompt
+from config import get_data_path, get_tool_config
 
 load_dotenv(Path(__file__).resolve().with_name(".env"))
 
@@ -25,14 +26,22 @@ SQUIDPY_REPO_PATH = "./packages_available/squidpy"
 SPATIALDATA_REPO_PATH = "./packages_available/spatialdata"
 COMBINED_PERSIST_DIR = "./db/chroma_combined_db"
 
+_DATA_HINTS = ("read_h5ad", "read_zarr", "SpatialData.read", "sq.read.", "adata")
+
+_python_repl = None
+
 
 class SquidpyRAGState(TypedDict):
     query: str
     context: List[Document]
     filtered_context: List[Document]
     answer: str
+    generated_code: str
+    execution_output: str
+    execution_success: bool
     chat_history: List[AnyMessage]
     rewrite_attempts: int
+    data_path: str
 
 
 class GradeDoc(BaseModel):
@@ -41,10 +50,73 @@ class GradeDoc(BaseModel):
     )
 
 
+class GeneratedAnswer(BaseModel):
+    code: str = Field(
+        description="Executable Python code only. No markdown fences. No prose."
+    )
+    explanation: str = Field(
+        description="Concise explanation of the code and Squidpy/SpatialData concepts used."
+    )
+
+
+def _max_rewrite_attempts() -> int:
+    return get_tool_config().rag_max_rewrite_attempts
+
+
 def decide_relevance(state: SquidpyRAGState) -> Literal["generate", "rewrite_query"]:
-    if state["filtered_context"] or state["rewrite_attempts"] >= 3:
+    if state["filtered_context"] or state["rewrite_attempts"] >= _max_rewrite_attempts():
         return "generate"
     return "rewrite_query"
+
+
+def decide_execution(state: SquidpyRAGState) -> Literal["end", "rewrite_query"]:
+    if state["execution_success"]:
+        return "end"
+    if state["rewrite_attempts"] >= _max_rewrite_attempts():
+        return "end"
+    return "rewrite_query"
+
+
+def _execution_failed(output: str) -> bool:
+    """Return True if PythonREPL output indicates an error."""
+    if not output or not output.strip():
+        return False
+    failure_markers = (
+        "Execution timed out",
+        "External execution error",
+        "exit_code=",
+        "Execution skipped:",
+        "No code was generated",
+    )
+    if output.startswith(
+        (
+            "SyntaxError",
+            "NameError",
+            "TypeError",
+            "ValueError",
+            "KeyError",
+            "ImportError",
+            "ModuleNotFoundError",
+            "FileNotFoundError",
+            "AttributeError",
+            "RuntimeError",
+        )
+    ):
+        return True
+    return any(marker in output for marker in failure_markers)
+
+
+def _code_requires_data(code: str) -> bool:
+    return any(hint in code for hint in _DATA_HINTS)
+
+
+def _get_python_repl():
+    global _python_repl
+    if _python_repl is None:
+        from tools import PythonREPL
+
+        _python_repl = PythonREPL()
+    return _python_repl
 
 
 def _get_lm_studio_embeddings() -> OpenAIEmbeddings:
@@ -72,6 +144,19 @@ def _load_python_chunks(repo_path: str, source_repo: str) -> List[Document]:
     for chunk in chunks:
         chunk.metadata["source_repo"] = source_repo
     return chunks
+
+
+def _format_run_response(response: Dict[str, Any]) -> str:
+    parts = [response.get("answer") or ""]
+    generated_code = response.get("generated_code", "")
+    execution_output = response.get("execution_output", "")
+
+    if generated_code:
+        parts.append(f"\n\n--- Generated code ---\n{generated_code}")
+    if execution_output:
+        label = "Execution output" if response.get("execution_success") else "Execution error"
+        parts.append(f"\n\n--- {label} ---\n{execution_output}")
+    return "".join(parts)
 
 
 class SquidpyRAGTool:
@@ -136,6 +221,8 @@ class SquidpyRAGTool:
             temperature=0,
         )
         grader_llm = llm.with_structured_output(GradeDoc)
+        generator_llm = llm.with_structured_output(GeneratedAnswer)
+        rag_exec_enabled = get_tool_config().rag_exec_enabled
 
         rewrite_prompt = ChatPromptTemplate.from_messages([
             (
@@ -144,7 +231,10 @@ class SquidpyRAGTool:
                 "Rewrite the user's query to be more specific and retrievable from a Python "
                 "codebase index. Output only the rewritten query, nothing else.",
             ),
-            ("user", "Original query: {query}\n\nRewritten query:"),
+            (
+                "user",
+                "Original query: {query}\n\n{execution_feedback}Rewritten query:",
+            ),
         ])
         rewriter = rewrite_prompt | llm
 
@@ -172,6 +262,19 @@ class SquidpyRAGTool:
                 for doc in docs
             )
             chat_history = state["chat_history"]
+            data_path = state.get("data_path", "")
+
+            data_path_instruction = (
+                "No data path was provided. Keep the code example minimal and self-contained."
+            )
+            if data_path:
+                data_path_instruction = (
+                    f"A data path was provided: {data_path}\n"
+                    "Use it exactly in the generated code. Examples:\n"
+                    f'- h5ad: adata = sc.read_h5ad(r"{data_path}")\n'
+                    f'- zarr: import spatialdata as sd; sdata = sd.read_zarr(r"{data_path}")\n'
+                    "Pick the loader appropriate for the file extension and query."
+                )
 
             prompt = ChatPromptTemplate.from_messages([
                 MessagesPlaceholder("chat_history"),
@@ -184,15 +287,14 @@ class SquidpyRAGTool:
                 (
                     "user",
                     "You are an expert in Squidpy and SpatialData, specializing in providing "
-                    "authentic Python code and explanations on their usage. IMPORTANT: do not use "
-                    "python bracket for the code. REPEAT: do not use python bracket for the code. "
-                    "For each query, respond with:\n"
-                    "1. Python code to solve the user's question (Squidpy or SpatialData as appropriate).\n"
-                    "2. A concise explanation of the code, focusing on library-specific concepts, "
-                    "methods, and relevant parameters.\n\n"
-                    "3. REMEMBER to specify shape = None for STARmap spatial transcriptomic data.\n"
-                    "The following are some additional instructions:\n"
-                    "{spatial_processing_prompt}\n\n"
+                    "authentic Python code and explanations on their usage.\n"
+                    "Return structured output with two fields:\n"
+                    "- code: executable Python only (no markdown fences, no prose)\n"
+                    "- explanation: concise explanation of the code\n\n"
+                    "REMEMBER to specify shape = None for STARmap spatial transcriptomic data.\n"
+                    "The code must be runnable as-is in a Python REPL.\n"
+                    "{data_path_instruction}\n\n"
+                    "Additional instructions:\n{spatial_processing_prompt}\n\n"
                     "CONTEXT FROM CODEBASE:\n{context_content}\n\n",
                 ),
                 ("user", "USER QUESTION: {query}"),
@@ -203,12 +305,51 @@ class SquidpyRAGTool:
                 "chat_history": chat_history,
                 "context_content": context_content,
                 "spatial_processing_prompt": spatial_processing_prompt,
+                "data_path_instruction": data_path_instruction,
             })
-            response = llm.invoke(messages)
-            return {"answer": response.content}
+            result = generator_llm.invoke(messages)
+            return {
+                "answer": result.explanation,
+                "generated_code": result.code,
+            }
+
+        def execute(state: SquidpyRAGState):
+            code = state.get("generated_code", "").strip()
+            if not code:
+                return {
+                    "execution_output": "No code was generated to execute.",
+                    "execution_success": False,
+                }
+
+            if not state.get("data_path") and _code_requires_data(code):
+                return {
+                    "execution_output": (
+                        "Execution skipped: generated code references data files but no "
+                        "data_path was provided."
+                    ),
+                    "execution_success": False,
+                }
+
+            tool_config = get_tool_config()
+            timeout = tool_config.rag_exec_timeout
+            output = _get_python_repl().run(code, timeout=timeout)
+            success = not _execution_failed(output)
+
+            return {
+                "execution_output": output[: tool_config.max_output_length],
+                "execution_success": success,
+            }
 
         def rewrite_query(state: SquidpyRAGState):
-            response = rewriter.invoke({"query": state["query"]})
+            execution_feedback = ""
+            if state.get("execution_output") and not state.get("execution_success", True):
+                execution_feedback = (
+                    f"Previous code failed with:\n{state['execution_output']}\n\n"
+                )
+            response = rewriter.invoke({
+                "query": state["query"],
+                "execution_feedback": execution_feedback,
+            })
             rewritten = response.content.strip()
             return {
                 "query": rewritten,
@@ -229,14 +370,31 @@ class SquidpyRAGTool:
             {"generate": "generate", "rewrite_query": "rewrite_query"},
         )
         graph_builder.add_edge("rewrite_query", "retrieve")
-        graph_builder.add_edge("generate", END)
+
+        if rag_exec_enabled:
+            graph_builder.add_node("execute", execute)
+            graph_builder.add_edge("generate", "execute")
+            graph_builder.add_conditional_edges(
+                "execute",
+                decide_execution,
+                {"end": END, "rewrite_query": "rewrite_query"},
+            )
+        else:
+            graph_builder.add_edge("generate", END)
 
         return graph_builder.compile()
 
-    def run(self, query: str, chat_history: List[AnyMessage] = None):
+    def run(
+        self,
+        query: str,
+        chat_history: List[AnyMessage] = None,
+        data_path: str = None,
+    ) -> str:
         """Run the Squidpy/SpatialData RAG pipeline with the given query and chat history."""
         if chat_history is None:
             chat_history = []
+
+        resolved_data_path = data_path or get_data_path() or ""
 
         response = self.rag_pipeline.invoke({
             "query": query,
@@ -244,10 +402,14 @@ class SquidpyRAGTool:
             "context": [],
             "filtered_context": [],
             "answer": "",
+            "generated_code": "",
+            "execution_output": "",
+            "execution_success": False,
             "rewrite_attempts": 0,
+            "data_path": resolved_data_path,
         })
 
-        return response["answer"]
+        return _format_run_response(response)
 
 
 _squidpy_rag: SquidpyRAGTool | None = None
@@ -266,16 +428,21 @@ def _get_squidpy_rag() -> SquidpyRAGTool | None:
 
 
 @tool
-def squidpy_rag_agent(state: Annotated[Dict, InjectedState], query: str) -> str:
+def squidpy_rag_agent(
+    state: Annotated[Dict, InjectedState],
+    query: str,
+    data_path: str = "",
+) -> str:
     """Tool that provides Squidpy and SpatialData code and explanations based on RAG.
     Uses the Squidpy and SpatialData codebases to generate accurate code for spatial
-    transcriptomics analysis.
+    transcriptomics analysis, optionally executing the generated code.
 
     Args:
         query: The query to answer using Squidpy/SpatialData knowledge
+        data_path: Optional path to h5ad or zarr data for code execution
 
     Returns:
-        str: Code and explanation for the query
+        str: Explanation, generated code, and execution output when enabled
     """
     chat_history = []
 
@@ -286,4 +453,4 @@ def squidpy_rag_agent(state: Annotated[Dict, InjectedState], query: str) -> str:
             "Reason: LM Studio is not reachable or the combined index could not be initialized. "
             "Ensure gemma4-e2b and an embedding model are loaded at http://localhost:1234/v1."
         )
-    return rag.run(query, chat_history)
+    return rag.run(query, chat_history, data_path=data_path or None)
