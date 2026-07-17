@@ -15,6 +15,7 @@ from squidpy_rag import (
     decide_relevance,
     _code_requires_data,
     _execution_failed,
+    _prepare_code_for_execution,
 )
 
 
@@ -105,8 +106,16 @@ def test_execution_failed_detects_traceback():
 
 
 def test_code_requires_data_heuristic():
-    assert _code_requires_data("sdata = sd.read_zarr('/path')") is True
+    assert _code_requires_data("sdata = sd.read_zarr(DATA_PATH)") is True
     assert _code_requires_data("import squidpy as sq") is False
+
+
+def test_prepare_code_injects_data_path():
+    code = "import spatialdata as sd; sdata = sd.read_zarr(DATA_PATH)"
+    zarr_path = r"C:\Pascal's Folders\QIMR\SCOPE_sample_40.zarr"
+    prepared = _prepare_code_for_execution(code, zarr_path)
+    assert prepared.startswith(f"DATA_PATH = {zarr_path!r}\n")
+    assert "read_zarr(DATA_PATH)" in prepared
 
 
 @patch("squidpy_rag.get_tool_config")
@@ -233,6 +242,47 @@ def test_execute_skips_when_no_data_path(
     mock_repl.run.assert_not_called()
     assert result["execution_success"] is False
     assert "Execution skipped" in result["execution_output"]
+
+
+@patch("squidpy_rag.get_tool_config")
+@patch("squidpy_rag._get_python_repl")
+@patch("squidpy_rag.SquidpyRAGTool.setup_combined_index")
+@patch("squidpy_rag.ChatOpenAI")
+def test_execute_injects_data_path(
+    mock_chat_openai, mock_setup_index, mock_get_repl, mock_get_tool_config
+):
+    mock_get_tool_config.return_value = _mock_tool_config(rag_exec_enabled=True)
+    mock_retriever = MagicMock()
+    mock_retriever.invoke.return_value = [
+        Document(page_content="read zarr", metadata={"source_repo": "spatialdata"}),
+    ]
+    mock_setup_index.return_value = mock_retriever
+
+    mock_repl = MagicMock()
+    mock_repl.run.return_value = "loaded"
+    mock_get_repl.return_value = mock_repl
+
+    mock_llm = MagicMock()
+    _setup_structured_llm(
+        mock_llm,
+        generated=GeneratedAnswer(
+            code="import spatialdata as sd; sd.read_zarr(DATA_PATH)",
+            explanation="Load zarr",
+        ),
+    )
+    mock_chat_openai.return_value = mock_llm
+
+    tool = SquidpyRAGTool()
+    zarr_path = r"C:\Pascal's Folders\QIMR\SCOPE_sample_40.zarr"
+    result = tool.rag_pipeline.invoke(_base_state(data_path=zarr_path))
+
+    expected_code = _prepare_code_for_execution(
+        "import spatialdata as sd; sd.read_zarr(DATA_PATH)",
+        zarr_path,
+    )
+    mock_repl.run.assert_called_once_with(expected_code, timeout=30)
+    assert result["execution_success"] is True
+    assert result["execution_output"] == "loaded"
 
 
 @patch("squidpy_rag.get_tool_config")
