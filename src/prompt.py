@@ -120,11 +120,13 @@ specific targeted analyses to comprehensive multi-step pipelines.
   </tool>
 
   <tool name="squidpy_rag_agent">
-    - Purpose: Retrieve Squidpy/SpatialData code via RAG, generate an answer, and execute the code
+    - Purpose: Retrieve SpatialData/Squidpy code via RAG, generate an answer, and execute the code
     - Index: db/chroma_combined_db (LM Studio local embeddings; requires gemma4-e2b + embedding model loaded)
-    - Optional: pass data_path for code that reads h5ad or zarr spatial datasets
+    - Generates SpatialData-first code; Squidpy is used only for spatial statistics and plotting
+    - Optional: pass data_path for code that reads h5ad or zarr spatial datasets. A .zarr path is
+      pre-loaded as `sdata` and a .h5ad path as `adata` before the generated code runs
     - Output: explanation + generated code + execution stdout (or error if execution fails)
-    - When: Use when you need Squidpy or SpatialData code patterns or API guidance; pass data_path when code needs real data
+    - When: Use when you need SpatialData or Squidpy code patterns or API guidance; pass data_path when code needs real data
   </tool>
 
   <tool name="visualize_umap">
@@ -626,4 +628,54 @@ When visualizing results, it's essential to apply the following plotting functio
 
 In summary, each of these functions should be applied independently to each sample to prevent spatial artifacts and maintain sample-specific spatial integrity. 
 This approach ensures reliable spatial relationships within each sample, preserving the biological context in spatial analyses.
+"""
+
+
+spatialdata_processing_prompt = """
+SpatialData is the data model and I/O layer; Squidpy is the analysis and plotting layer that runs on top of it.
+Write SpatialData-native code for anything involving loading, structure, elements, coordinates or subsetting, and
+only reach for Squidpy when you need a statistic or plot that SpatialData does not provide.
+
+## The SpatialData object
+A `SpatialData` object (conventionally `sdata`) is a container of named elements, NOT an AnnData object.
+It exposes five element dictionaries:
+
+- `sdata.images` - raster images (xarray DataArray / DataTree)
+- `sdata.labels` - segmentation masks
+- `sdata.points` - point clouds (dask DataFrame, e.g. transcript locations)
+- `sdata.shapes` - polygons / circles (GeoDataFrame, e.g. cell boundaries, Visium spots)
+- `sdata.tables` - annotation tables, each one an AnnData
+
+Consequences you must respect:
+
+- `sdata` has no `.obs`, `.var`, `.X`, `.obs_names` or `.n_obs`. Those live on a table, e.g. `sdata.tables["table"].obs`.
+- Never pass `sdata` to a function that expects AnnData. Pass the table instead.
+- Element names vary between datasets. Discover them with `list(sdata.tables)`, `list(sdata.images)` etc.
+  rather than assuming a name like `"table"` exists.
+- To get the AnnData that Squidpy needs: `adata = sdata.tables[next(iter(sdata.tables))]`.
+
+## Package ownership of common functions
+Calling one of these on the wrong package raises AttributeError, so keep them straight:
+
+- `spatialdata.read_zarr(path)` reads a `.zarr` store. `squidpy` has no `read_zarr`.
+- `scanpy.read_h5ad(path)` reads a `.h5ad` file. Neither `spatialdata` nor `squidpy` has `read_h5ad`.
+- `sdata.write(path)` writes a SpatialData zarr store.
+- Spatial statistics (`spatial_neighbors`, `nhood_enrichment`, `spatial_autocorr`, `co_occurrence`, `ripley`)
+  belong to `squidpy.gr` and operate on an AnnData table.
+- `squidpy.pl` plotting functions also take an AnnData table.
+
+## SpatialData operations to prefer
+- `sdata.filter_by_coordinate_system(cs)` to restrict to one coordinate system / sample.
+- `spatialdata.bounding_box_query(...)` / `spatialdata.polygon_query(...)` for spatial subsetting.
+- `spatialdata.aggregate(...)` to summarise points or images over shapes or labels.
+- `spatialdata.transform(...)` and `spatialdata.transformations` to move elements between coordinate systems.
+- `spatialdata.get_extent(element)` for the spatial extent of an element.
+- `sdata.coordinate_systems` lists the available coordinate systems, which is usually how multi-sample
+  datasets are separated.
+
+## Multi-sample work
+Coordinate systems are the SpatialData-native way to separate samples. When a dataset holds several samples,
+iterate over `sdata.coordinate_systems` (or the sample column in the table's `.obs`) and run graph
+construction and plotting per sample, for the same reason described in the Squidpy guidance above:
+pooled spatial coordinates produce meaningless neighbourhood structures.
 """
