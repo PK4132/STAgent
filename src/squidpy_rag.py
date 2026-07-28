@@ -17,7 +17,7 @@ from langgraph.graph import StateGraph, START, END
 from langchain_core.messages import AnyMessage
 from langchain_core.tools import tool
 from langgraph.prebuilt import InjectedState
-from prompt import spatial_processing_prompt
+from prompt import spatial_processing_prompt, spatialdata_processing_prompt
 from config import get_data_path, get_tool_config
 
 load_dotenv(Path(__file__).resolve().with_name(".env"))
@@ -26,7 +26,14 @@ SQUIDPY_REPO_PATH = "./packages_available/squidpy"
 SPATIALDATA_REPO_PATH = "./packages_available/spatialdata"
 COMBINED_PERSIST_DIR = "./db/chroma_combined_db"
 
-_DATA_HINTS = ("read_h5ad", "read_zarr", "SpatialData.read", "sq.read.", "adata")
+# SpatialData is the target API, so most of the context budget goes to it. A couple of
+# Squidpy chunks stay reachable because SpatialData has no spatial-statistics equivalents.
+PRIMARY_REPO = "spatialdata"
+PRIMARY_K = 6
+SECONDARY_REPO = "squidpy"
+SECONDARY_K = 2
+
+_DATA_HINTS = ("read_h5ad", "read_zarr", "SpatialData.read", "sq.read.", "adata", "sdata")
 
 _python_repl = None
 
@@ -57,7 +64,7 @@ class GeneratedAnswer(BaseModel):
         description="Executable Python code only. No markdown fences. No prose."
     )
     explanation: str = Field(
-        description="Concise explanation of the code and Squidpy/SpatialData concepts used."
+        description="Concise explanation of the code and SpatialData/Squidpy concepts used."
     )
 
 
@@ -118,31 +125,88 @@ def _code_requires_data(code: str) -> bool:
     return any(hint in code for hint in _DATA_HINTS)
 
 
-def _data_loader_hint(data_path: str) -> str:
-    """Tell the model which loader matches the actual DATA_PATH extension."""
+# The execution preamble loads the dataset itself, so the model only has to use the
+# resulting variable. Maps file extension -> (variable name, load statements).
+_PRELOAD_TEMPLATES = {
+    ".zarr": ("sdata", "import spatialdata as sd\nsdata = sd.read_zarr(DATA_PATH)"),
+    ".h5ad": ("adata", "import scanpy as sc\nadata = sc.read_h5ad(DATA_PATH)"),
+}
+
+_LOADER_NAMES = ("read_zarr", "read_h5ad")
+
+# Attributing a loader to the wrong package was the most common generation failure, so
+# each loader is pinned to the packages that actually own it.
+_LOADER_OWNERS = {
+    "read_zarr": {"spatialdata"},
+    "read_h5ad": {"scanpy", "anndata"},
+}
+
+_PACKAGE_ALIASES = {
+    "sq.": "squidpy",
+    "squidpy.": "squidpy",
+    "sd.": "spatialdata",
+    "spatialdata.": "spatialdata",
+    "sc.": "scanpy",
+    "scanpy.": "scanpy",
+    "ad.": "anndata",
+    "anndata.": "anndata",
+}
+
+
+def _preloaded_binding(data_path: str) -> tuple[str, str] | None:
+    """Variable name and load statements the preamble injects for this file type."""
+    if not data_path:
+        return None
+    return _PRELOAD_TEMPLATES.get(Path(data_path).suffix.lower())
+
+
+def _data_access_hint(data_path: str) -> str:
+    """Describe the already-loaded object so the model never writes a load call."""
     suffix = Path(data_path).suffix.lower()
     if suffix == ".zarr":
         return (
-            "DATA_PATH is a .zarr store. Load it with "
-            "`import spatialdata as sd` then `sdata = sd.read_zarr(DATA_PATH)`. "
-            "Never call read_h5ad on this path."
+            "The dataset is ALREADY LOADED for you as `sdata`, a spatialdata.SpatialData "
+            "object read from the .zarr store.\n"
+            "Do NOT import spatialdata, do NOT call read_zarr, do NOT reference DATA_PATH. "
+            "Start your code by using `sdata` directly.\n"
+            "`sdata` is a container, not an AnnData: its elements live in sdata.images, "
+            "sdata.labels, sdata.points, sdata.shapes and sdata.tables.\n"
+            "For any Squidpy call, first pull out the AnnData table, e.g. "
+            "`adata = sdata.tables[next(iter(sdata.tables))]`."
         )
     if suffix == ".h5ad":
         return (
-            "DATA_PATH is a .h5ad file. Load it with "
-            "`import scanpy as sc` then `adata = sc.read_h5ad(DATA_PATH)`. "
-            "squidpy has no read_h5ad function. Never call read_zarr on this path."
+            "The dataset is ALREADY LOADED for you as `adata`, an AnnData object read from "
+            "the .h5ad file.\n"
+            "Do NOT call read_h5ad, do NOT reference DATA_PATH. Start your code by using "
+            "`adata` directly."
         )
     return (
-        "Choose the loader matching the DATA_PATH extension: "
-        ".zarr uses spatialdata.read_zarr, .h5ad uses scanpy.read_h5ad."
+        "The file path is available as the variable DATA_PATH. Use DATA_PATH only; never "
+        "hardcode a path string. A .zarr store is read with spatialdata.read_zarr and a "
+        ".h5ad file with scanpy.read_h5ad."
     )
 
 
 def _wrong_loader_reason(code: str, data_path: str) -> str | None:
-    """Return why the code's loader contradicts the data file, or None if consistent."""
-    if "sq.read_h5ad" in code or "squidpy.read_h5ad" in code:
-        return "squidpy has no read_h5ad function; use scanpy.read_h5ad instead."
+    """Return why the code's data loading is wrong, or None if it is acceptable."""
+    binding = _preloaded_binding(data_path)
+    if binding and any(loader in code for loader in _LOADER_NAMES):
+        variable = binding[0]
+        return (
+            f"the dataset is already loaded as `{variable}`; the code must use `{variable}` "
+            "directly instead of calling read_zarr or read_h5ad again."
+        )
+
+    for loader, owners in _LOADER_OWNERS.items():
+        if loader not in code:
+            continue
+        for prefix, package in _PACKAGE_ALIASES.items():
+            if f"{prefix}{loader}" in code and package not in owners:
+                return (
+                    f"{package} has no {loader} function; {loader} belongs to "
+                    f"{' or '.join(sorted(owners))}."
+                )
 
     suffix = Path(data_path).suffix.lower()
     if suffix == ".zarr" and "read_h5ad" in code:
@@ -153,10 +217,18 @@ def _wrong_loader_reason(code: str, data_path: str) -> str | None:
 
 
 def _prepare_code_for_execution(code: str, data_path: str) -> str:
-    """Prepend a trusted DATA_PATH so the LLM never needs to copy Windows paths."""
+    """Prepend a trusted DATA_PATH and, when the type is known, load the data too.
+
+    Loading here rather than in the generated code removes the two failure modes the
+    model kept hitting: mangling Windows paths, and attributing read_zarr to squidpy.
+    """
     if not data_path:
         return code
-    return f"DATA_PATH = {data_path!r}\n{code}"
+    preamble = f"DATA_PATH = {data_path!r}\n"
+    binding = _preloaded_binding(data_path)
+    if binding:
+        preamble += f"{binding[1]}\n"
+    return f"{preamble}{code}"
 
 
 def _get_python_repl():
@@ -216,6 +288,36 @@ def _module_label(metadata: Dict[str, Any]) -> str:
             if parts:
                 return ".".join(parts)
     return f"{repo}: {source}"
+
+
+class RepoWeightedRetriever:
+    """Retriever that fills most of the context with one repo before topping up with another.
+
+    An unweighted search over the combined index returns whichever chunks are closest in
+    embedding space, which for spatial-analysis wording is usually Squidpy. Splitting the
+    search by `source_repo` guarantees SpatialData dominates the context regardless of
+    how the question is phrased.
+    """
+
+    def __init__(
+        self,
+        store,
+        primary_repo: str = PRIMARY_REPO,
+        primary_k: int = PRIMARY_K,
+        secondary_repo: str = SECONDARY_REPO,
+        secondary_k: int = SECONDARY_K,
+    ):
+        self._primary = store.as_retriever(
+            search_type="mmr",
+            search_kwargs={"k": primary_k, "filter": {"source_repo": primary_repo}},
+        )
+        self._secondary = store.as_retriever(
+            search_type="mmr",
+            search_kwargs={"k": secondary_k, "filter": {"source_repo": secondary_repo}},
+        )
+
+    def invoke(self, query: str) -> List[Document]:
+        return list(self._primary.invoke(query)) + list(self._secondary.invoke(query))
 
 
 def _format_context(docs: List[Document]) -> str:
@@ -288,7 +390,7 @@ class SquidpyRAGTool:
             )
             print(f"Loaded existing Chroma database from {COMBINED_PERSIST_DIR}")
 
-        return combined_store.as_retriever(search_type="mmr", search_kwargs={"k": 8})
+        return RepoWeightedRetriever(combined_store)
 
     def create_squidpy_rag_pipeline(self):
         """Create the self-reflective RAG pipeline for Squidpy and SpatialData."""
@@ -305,11 +407,14 @@ class SquidpyRAGTool:
         rewrite_prompt = ChatPromptTemplate.from_messages([
             (
                 "system",
-                "You are a query rewriter for a Squidpy and SpatialData code RAG system. "
+                "You are a query rewriter for a SpatialData and Squidpy code RAG system. "
                 "Rewrite the user's query to be more specific and retrievable from a Python "
-                "codebase index. Keep the same topic, dataset and intent as the original "
-                "query: never substitute a different subject. Do not answer the query. "
-                "Output only the rewritten query, nothing else.",
+                "codebase index, favouring SpatialData terminology (elements, tables, "
+                "coordinate systems, transformations, queries) over Squidpy terminology "
+                "unless the query is specifically about spatial statistics or plotting. "
+                "Keep the same topic, dataset and intent as the original query: never "
+                "substitute a different subject. Do not answer the query. Output only the "
+                "rewritten query, nothing else.",
             ),
             (
                 "user",
@@ -355,10 +460,8 @@ class SquidpyRAGTool:
             )
             if data_path:
                 data_path_instruction = (
-                    "A data file path will be injected as the variable DATA_PATH before "
-                    "your code runs.\n"
-                    "Use DATA_PATH only — do NOT hardcode any file path string in the code.\n"
-                    f"{_data_loader_hint(data_path)}"
+                    "DATA ACCESS:\n"
+                    f"{_data_access_hint(data_path)}"
                 )
 
             prompt = ChatPromptTemplate.from_messages([
@@ -371,8 +474,12 @@ class SquidpyRAGTool:
                 ),
                 (
                     "user",
-                    "You are an expert in Squidpy and SpatialData, specializing in providing "
-                    "authentic Python code and explanations on their usage.\n"
+                    "You are an expert in SpatialData, specializing in providing authentic "
+                    "Python code and explanations on its usage. SpatialData is your default "
+                    "toolkit: use it for reading, inspecting, subsetting, transforming and "
+                    "aggregating spatial omics data. Reach for Squidpy only for spatial "
+                    "statistics and plotting that SpatialData does not provide, and run those "
+                    "on an AnnData table taken out of the SpatialData object.\n"
                     "Return structured output with two fields:\n"
                     "- code: executable Python only (no markdown fences, no prose)\n"
                     "- explanation: concise explanation of the code\n\n"
@@ -380,6 +487,8 @@ class SquidpyRAGTool:
                     "The code must be runnable as-is in a Python REPL.\n\n"
                     "CODE RULES:\n"
                     "- Answer only the user question; never substitute an unrelated example.\n"
+                    "- Prefer SpatialData APIs. Do not use a Squidpy function when a "
+                    "SpatialData one does the job.\n"
                     "- Do NOT write timeout, retry, signal, threading or multiprocessing "
                     "scaffolding; the execution harness already enforces a timeout.\n"
                     "- Call every function you define; never leave the result as an "
@@ -397,14 +506,21 @@ class SquidpyRAGTool:
                     "- If you create matplotlib figures in a loop, close each one with "
                     "plt.close() to avoid exhausting memory.\n"
                     "- Import the top-level package and call symbols fully qualified, e.g. "
-                    "`import squidpy as sq` then `sq.gr.spatial_neighbors(adata)`. Do NOT "
-                    "write `from squidpy.tl import spatial_neighbors` style imports.\n"
+                    "`import spatialdata as sd` then `sd.bounding_box_query(...)`. Do NOT "
+                    "write `from spatialdata._core.query import bounding_box_query` style "
+                    "imports.\n"
+                    "- Keep package ownership straight: read_zarr and the query, transform "
+                    "and aggregate helpers belong to `spatialdata`; spatial_neighbors, "
+                    "nhood_enrichment and the plotting helpers belong to `squidpy`. Calling "
+                    "one on the other package raises AttributeError.\n"
                     "- Every context block below starts with `# from <module>` giving the "
                     "real module path of that code. Use those paths to decide where a "
                     "function lives; never guess a submodule name.\n\n"
                     "{data_path_instruction}\n\n"
                     "{error_feedback}"
-                    "Additional instructions:\n{spatial_processing_prompt}\n\n"
+                    "SPATIALDATA GUIDANCE:\n{spatialdata_processing_prompt}\n\n"
+                    "SQUIDPY GUIDANCE (only for analysis and plotting steps):\n"
+                    "{spatial_processing_prompt}\n\n"
                     "CONTEXT FROM CODEBASE:\n{context_content}\n\n",
                 ),
                 ("user", "USER QUESTION: {query}"),
@@ -414,6 +530,7 @@ class SquidpyRAGTool:
                 "query": _resolve_question(state),
                 "chat_history": chat_history,
                 "context_content": context_content,
+                "spatialdata_processing_prompt": spatialdata_processing_prompt,
                 "spatial_processing_prompt": spatial_processing_prompt,
                 "data_path_instruction": data_path_instruction,
                 "error_feedback": error_feedback,
@@ -443,12 +560,14 @@ class SquidpyRAGTool:
                     "execution_success": False,
                 }
 
-            if data_path and "DATA_PATH" not in code:
+            binding = _preloaded_binding(data_path)
+            expected_symbol = binding[0] if binding else "DATA_PATH"
+            if data_path and expected_symbol not in code:
                 return {
                     "execution_output": (
-                        "Execution rejected: a data_path was provided but the generated code "
-                        "never uses DATA_PATH, so it does not answer the question about the "
-                        "dataset."
+                        f"Execution rejected: a dataset was provided as `{expected_symbol}` but "
+                        f"the generated code never uses `{expected_symbol}`, so it does not "
+                        "answer the question about the dataset."
                     ),
                     "execution_success": False,
                 }
@@ -525,7 +644,7 @@ class SquidpyRAGTool:
         chat_history: List[AnyMessage] = None,
         data_path: str = None,
     ) -> str:
-        """Run the Squidpy/SpatialData RAG pipeline with the given query and chat history."""
+        """Run the SpatialData/Squidpy RAG pipeline with the given query and chat history."""
         if chat_history is None:
             chat_history = []
 
@@ -570,12 +689,12 @@ def squidpy_rag_agent(
     query: str,
     data_path: str = "",
 ) -> str:
-    """Tool that provides Squidpy and SpatialData code and explanations based on RAG.
-    Uses the Squidpy and SpatialData codebases to generate accurate code for spatial
-    transcriptomics analysis, optionally executing the generated code.
+    """Tool that provides SpatialData and Squidpy code and explanations based on RAG.
+    Generates SpatialData-first code for spatial transcriptomics analysis, falling back to
+    Squidpy for spatial statistics and plotting, and optionally executing the result.
 
     Args:
-        query: The query to answer using Squidpy/SpatialData knowledge
+        query: The query to answer using SpatialData/Squidpy knowledge
         data_path: Optional path to h5ad or zarr data for code execution
 
     Returns:
