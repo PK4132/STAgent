@@ -118,6 +118,40 @@ def _code_requires_data(code: str) -> bool:
     return any(hint in code for hint in _DATA_HINTS)
 
 
+def _data_loader_hint(data_path: str) -> str:
+    """Tell the model which loader matches the actual DATA_PATH extension."""
+    suffix = Path(data_path).suffix.lower()
+    if suffix == ".zarr":
+        return (
+            "DATA_PATH is a .zarr store. Load it with "
+            "`import spatialdata as sd` then `sdata = sd.read_zarr(DATA_PATH)`. "
+            "Never call read_h5ad on this path."
+        )
+    if suffix == ".h5ad":
+        return (
+            "DATA_PATH is a .h5ad file. Load it with "
+            "`import scanpy as sc` then `adata = sc.read_h5ad(DATA_PATH)`. "
+            "squidpy has no read_h5ad function. Never call read_zarr on this path."
+        )
+    return (
+        "Choose the loader matching the DATA_PATH extension: "
+        ".zarr uses spatialdata.read_zarr, .h5ad uses scanpy.read_h5ad."
+    )
+
+
+def _wrong_loader_reason(code: str, data_path: str) -> str | None:
+    """Return why the code's loader contradicts the data file, or None if consistent."""
+    if "sq.read_h5ad" in code or "squidpy.read_h5ad" in code:
+        return "squidpy has no read_h5ad function; use scanpy.read_h5ad instead."
+
+    suffix = Path(data_path).suffix.lower()
+    if suffix == ".zarr" and "read_h5ad" in code:
+        return "DATA_PATH is a .zarr store but the code calls read_h5ad."
+    if suffix == ".h5ad" and "read_zarr" in code:
+        return "DATA_PATH is a .h5ad file but the code calls read_zarr."
+    return None
+
+
 def _prepare_code_for_execution(code: str, data_path: str) -> str:
     """Prepend a trusted DATA_PATH so the LLM never needs to copy Windows paths."""
     if not data_path:
@@ -295,12 +329,10 @@ class SquidpyRAGTool:
             )
             if data_path:
                 data_path_instruction = (
-                    "A data file path will be injected as the variable DATA_PATH before your code runs.\n"
+                    "A data file path will be injected as the variable DATA_PATH before "
+                    "your code runs.\n"
                     "Use DATA_PATH only — do NOT hardcode any file path string in the code.\n"
-                    "Examples:\n"
-                    "- h5ad: adata = sc.read_h5ad(DATA_PATH)\n"
-                    "- zarr: import spatialdata as sd; sdata = sd.read_zarr(DATA_PATH)\n"
-                    "Pick the loader appropriate for the file extension and query."
+                    f"{_data_loader_hint(data_path)}"
                 )
 
             prompt = ChatPromptTemplate.from_messages([
@@ -326,7 +358,18 @@ class SquidpyRAGTool:
                     "scaffolding; the execution harness already enforces a timeout.\n"
                     "- Call every function you define; never leave the result as an "
                     "uncalled function object.\n"
-                    "- Print the values the user asked for.\n\n"
+                    "- Print the values the user asked for.\n"
+                    "- adata.obs_names holds CELL barcodes, never sample or group IDs. "
+                    "To group by sample, print adata.obs.columns first and use a real "
+                    "column such as adata.obs['sample'].\n"
+                    "- Never loop over every cell or every row. Operate on the whole "
+                    "object, or over a small number of groups.\n"
+                    "- Do not assume a column like 'cell_type' exists; check "
+                    "adata.obs.columns before using it.\n"
+                    "- Let exceptions propagate. Do NOT wrap the analysis in try/except "
+                    "blocks that only print the error.\n"
+                    "- If you create matplotlib figures in a loop, close each one with "
+                    "plt.close() to avoid exhausting memory.\n\n"
                     "{data_path_instruction}\n\n"
                     "{error_feedback}"
                     "Additional instructions:\n{spatial_processing_prompt}\n\n"
@@ -375,6 +418,13 @@ class SquidpyRAGTool:
                         "never uses DATA_PATH, so it does not answer the question about the "
                         "dataset."
                     ),
+                    "execution_success": False,
+                }
+
+            loader_problem = _wrong_loader_reason(code, data_path)
+            if loader_problem:
+                return {
+                    "execution_output": f"Execution rejected: {loader_problem}",
                     "execution_success": False,
                 }
 
