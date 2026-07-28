@@ -14,9 +14,11 @@ from squidpy_rag import (
     decide_execution,
     decide_relevance,
     _code_requires_data,
+    _data_loader_hint,
     _execution_failed,
     _prepare_code_for_execution,
     _resolve_question,
+    _wrong_loader_reason,
 )
 
 
@@ -111,6 +113,21 @@ def test_execution_failed_detects_traceback():
 def test_code_requires_data_heuristic():
     assert _code_requires_data("sdata = sd.read_zarr(DATA_PATH)") is True
     assert _code_requires_data("import squidpy as sq") is False
+
+
+def test_data_loader_hint_matches_extension():
+    assert "read_zarr" in _data_loader_hint(r"C:\data\sample.zarr")
+    assert "read_h5ad" in _data_loader_hint(r"C:\data\sample.h5ad")
+
+
+def test_wrong_loader_reason_flags_mismatches():
+    zarr_path = r"C:\data\sample.zarr"
+    h5ad_path = r"C:\data\sample.h5ad"
+
+    assert "read_h5ad" in _wrong_loader_reason("sc.read_h5ad(DATA_PATH)", zarr_path)
+    assert "read_zarr" in _wrong_loader_reason("sd.read_zarr(DATA_PATH)", h5ad_path)
+    assert "squidpy has no read_h5ad" in _wrong_loader_reason("sq.read_h5ad(DATA_PATH)", "")
+    assert _wrong_loader_reason("sd.read_zarr(DATA_PATH)", zarr_path) is None
 
 
 def test_resolve_question_prefers_original_over_rewrite():
@@ -319,6 +336,44 @@ def test_execute_rejects_code_ignoring_data_path(
         generated=GeneratedAnswer(
             code="def timeout(f, seconds):\n    return f\nprint(timeout)",
             explanation="A timeout decorator",
+        ),
+    )
+    mock_llm.invoke.return_value = MagicMock(content="rewritten query")
+    mock_chat_openai.return_value = mock_llm
+
+    tool = SquidpyRAGTool()
+    result = tool.rag_pipeline.invoke(
+        _base_state(data_path=r"C:\Pascal's Folders\QIMR\SCOPE_sample_40.zarr")
+    )
+
+    mock_repl.run.assert_not_called()
+    assert result["execution_success"] is False
+    assert "Execution rejected" in result["execution_output"]
+
+
+@patch("squidpy_rag.get_tool_config")
+@patch("squidpy_rag._get_python_repl")
+@patch("squidpy_rag.SquidpyRAGTool.setup_combined_index")
+@patch("squidpy_rag.ChatOpenAI")
+def test_execute_rejects_h5ad_loader_on_zarr_path(
+    mock_chat_openai, mock_setup_index, mock_get_repl, mock_get_tool_config
+):
+    mock_get_tool_config.return_value = _mock_tool_config(rag_exec_enabled=True)
+    mock_retriever = MagicMock()
+    mock_retriever.invoke.return_value = [
+        Document(page_content="read zarr", metadata={"source_repo": "spatialdata"}),
+    ]
+    mock_setup_index.return_value = mock_retriever
+
+    mock_repl = MagicMock()
+    mock_get_repl.return_value = mock_repl
+
+    mock_llm = MagicMock()
+    _setup_structured_llm(
+        mock_llm,
+        generated=GeneratedAnswer(
+            code="import squidpy as sq\nadata = sq.read_h5ad(DATA_PATH)\nprint(adata)",
+            explanation="Load the data",
         ),
     )
     mock_llm.invoke.return_value = MagicMock(content="rewritten query")
