@@ -10,15 +10,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from squidpy_rag import (
     GeneratedAnswer,
     GradeDoc,
+    RepoWeightedRetriever,
     SquidpyRAGTool,
     decide_execution,
     decide_relevance,
     _code_requires_data,
-    _data_loader_hint,
+    _data_access_hint,
     _execution_failed,
     _format_context,
     _module_label,
     _prepare_code_for_execution,
+    _preloaded_binding,
     _resolve_question,
     _wrong_loader_reason,
 )
@@ -173,19 +175,67 @@ def test_format_context_exposes_module_paths():
     assert "def spatial_neighbors" in rendered
 
 
-def test_data_loader_hint_matches_extension():
-    assert "read_zarr" in _data_loader_hint(r"C:\data\sample.zarr")
-    assert "read_h5ad" in _data_loader_hint(r"C:\data\sample.h5ad")
+def test_preloaded_binding_matches_extension():
+    assert _preloaded_binding(r"C:\data\sample.zarr")[0] == "sdata"
+    assert _preloaded_binding(r"C:\data\sample.h5ad")[0] == "adata"
+    assert _preloaded_binding(r"C:\data\sample.csv") is None
+    assert _preloaded_binding("") is None
 
 
-def test_wrong_loader_reason_flags_mismatches():
+def test_data_access_hint_describes_preloaded_object():
+    zarr_hint = _data_access_hint(r"C:\data\sample.zarr")
+    assert "already loaded" in zarr_hint.lower()
+    assert "`sdata`" in zarr_hint
+    assert "sdata.tables" in zarr_hint
+
+    h5ad_hint = _data_access_hint(r"C:\data\sample.h5ad")
+    assert "`adata`" in h5ad_hint
+
+    # Unknown extensions have no preamble, so the model still gets DATA_PATH.
+    assert "DATA_PATH" in _data_access_hint(r"C:\data\sample.csv")
+
+
+def test_wrong_loader_reason_rejects_reloading_preloaded_data():
     zarr_path = r"C:\data\sample.zarr"
     h5ad_path = r"C:\data\sample.h5ad"
 
-    assert "read_h5ad" in _wrong_loader_reason("sc.read_h5ad(DATA_PATH)", zarr_path)
-    assert "read_zarr" in _wrong_loader_reason("sd.read_zarr(DATA_PATH)", h5ad_path)
+    reason = _wrong_loader_reason("sdata = sd.read_zarr(DATA_PATH)", zarr_path)
+    assert "already loaded as `sdata`" in reason
+    assert "already loaded as `adata`" in _wrong_loader_reason(
+        "adata = sc.read_h5ad(DATA_PATH)", h5ad_path
+    )
+    assert _wrong_loader_reason("print(list(sdata.tables))", zarr_path) is None
+
+
+def test_wrong_loader_reason_flags_package_ownership():
+    """Attributing a loader to the wrong package is the failure mode this guard exists for."""
+    assert "squidpy has no read_zarr" in _wrong_loader_reason("sq.read_zarr(DATA_PATH)", "")
     assert "squidpy has no read_h5ad" in _wrong_loader_reason("sq.read_h5ad(DATA_PATH)", "")
-    assert _wrong_loader_reason("sd.read_zarr(DATA_PATH)", zarr_path) is None
+    assert "spatialdata has no read_h5ad" in _wrong_loader_reason(
+        "spatialdata.read_h5ad(DATA_PATH)", ""
+    )
+    assert "scanpy has no read_zarr" in _wrong_loader_reason("sc.read_zarr(DATA_PATH)", "")
+    assert _wrong_loader_reason("sd.read_zarr(DATA_PATH)", "") is None
+    assert _wrong_loader_reason("sc.read_h5ad(DATA_PATH)", "") is None
+
+
+def test_repo_weighted_retriever_splits_search_by_repo():
+    """Most of the context budget must go to SpatialData regardless of query wording."""
+    store = MagicMock()
+    primary = MagicMock()
+    primary.invoke.return_value = [Document(page_content="spatialdata chunk")]
+    secondary = MagicMock()
+    secondary.invoke.return_value = [Document(page_content="squidpy chunk")]
+    store.as_retriever.side_effect = [primary, secondary]
+
+    docs = RepoWeightedRetriever(store).invoke("how do I read a zarr store")
+
+    primary_kwargs = store.as_retriever.call_args_list[0].kwargs["search_kwargs"]
+    secondary_kwargs = store.as_retriever.call_args_list[1].kwargs["search_kwargs"]
+    assert primary_kwargs["filter"] == {"source_repo": "spatialdata"}
+    assert secondary_kwargs["filter"] == {"source_repo": "squidpy"}
+    assert primary_kwargs["k"] > secondary_kwargs["k"]
+    assert [doc.page_content for doc in docs] == ["spatialdata chunk", "squidpy chunk"]
 
 
 def test_resolve_question_prefers_original_over_rewrite():
@@ -196,12 +246,27 @@ def test_resolve_question_prefers_original_over_rewrite():
     assert _resolve_question(state) == "How do I read a zarr store?"
 
 
-def test_prepare_code_injects_data_path():
-    code = "import spatialdata as sd; sdata = sd.read_zarr(DATA_PATH)"
+def test_prepare_code_injects_data_path_and_load():
+    code = "print(list(sdata.tables))"
     zarr_path = r"C:\Pascal's Folders\QIMR\SCOPE_sample_40.zarr"
     prepared = _prepare_code_for_execution(code, zarr_path)
+
     assert prepared.startswith(f"DATA_PATH = {zarr_path!r}\n")
-    assert "read_zarr(DATA_PATH)" in prepared
+    assert "import spatialdata as sd" in prepared
+    assert "sdata = sd.read_zarr(DATA_PATH)" in prepared
+    assert prepared.endswith(code)
+
+
+def test_prepare_code_injects_h5ad_load():
+    prepared = _prepare_code_for_execution("print(adata)", r"C:\data\sample.h5ad")
+    assert "adata = sc.read_h5ad(DATA_PATH)" in prepared
+
+
+def test_prepare_code_without_known_extension_only_injects_path():
+    prepared = _prepare_code_for_execution("print(DATA_PATH)", r"C:\data\sample.csv")
+    assert prepared.startswith("DATA_PATH = ")
+    assert "read_zarr" not in prepared
+    assert _prepare_code_for_execution("print('hi')", "") == "print('hi')"
 
 
 @patch("squidpy_rag.get_tool_config")
@@ -264,6 +329,41 @@ def test_generate_prompt_includes_module_paths(
 
     rendered = str(mock_generator.invoke.call_args.args[0])
     assert "# from squidpy.gr._build" in rendered
+
+
+@patch("squidpy_rag.get_tool_config")
+@patch("squidpy_rag.SquidpyRAGTool.setup_combined_index")
+@patch("squidpy_rag.ChatOpenAI")
+def test_generate_prompt_is_spatialdata_first(
+    mock_chat_openai, mock_setup_index, mock_get_tool_config
+):
+    """The prompt must lead with SpatialData and describe the pre-loaded sdata object."""
+    mock_get_tool_config.return_value = _mock_tool_config(rag_exec_enabled=False)
+    mock_retriever = MagicMock()
+    mock_retriever.invoke.return_value = [
+        Document(
+            page_content="def read_zarr(path): ...",
+            metadata={
+                "source_repo": "spatialdata",
+                "source": r"packages_available\spatialdata\src\spatialdata\_io\io_zarr.py",
+            },
+        ),
+    ]
+    mock_setup_index.return_value = mock_retriever
+
+    mock_llm = MagicMock()
+    _, mock_generator = _setup_structured_llm(mock_llm)
+    mock_chat_openai.return_value = mock_llm
+
+    tool = SquidpyRAGTool()
+    tool.rag_pipeline.invoke(_base_state(data_path=r"C:\data\sample.zarr"))
+
+    rendered = str(mock_generator.invoke.call_args.args[0])
+    assert "expert in SpatialData" in rendered
+    assert "Prefer SpatialData APIs" in rendered
+    assert "ALREADY LOADED" in rendered
+    assert "sdata.tables" in rendered
+    assert "SPATIALDATA GUIDANCE" in rendered
 
 
 @patch("squidpy_rag.get_tool_config")
@@ -383,8 +483,8 @@ def test_execute_injects_data_path(
     _setup_structured_llm(
         mock_llm,
         generated=GeneratedAnswer(
-            code="import spatialdata as sd; sd.read_zarr(DATA_PATH)",
-            explanation="Load zarr",
+            code="print(list(sdata.tables))",
+            explanation="List the tables",
         ),
     )
     mock_chat_openai.return_value = mock_llm
@@ -393,10 +493,7 @@ def test_execute_injects_data_path(
     zarr_path = r"C:\Pascal's Folders\QIMR\SCOPE_sample_40.zarr"
     result = tool.rag_pipeline.invoke(_base_state(data_path=zarr_path))
 
-    expected_code = _prepare_code_for_execution(
-        "import spatialdata as sd; sd.read_zarr(DATA_PATH)",
-        zarr_path,
-    )
+    expected_code = _prepare_code_for_execution("print(list(sdata.tables))", zarr_path)
     mock_repl.run.assert_called_once_with(expected_code, timeout=30)
     assert result["execution_success"] is True
     assert result["execution_output"] == "loaded"
@@ -444,7 +541,7 @@ def test_execute_rejects_code_ignoring_data_path(
 @patch("squidpy_rag._get_python_repl")
 @patch("squidpy_rag.SquidpyRAGTool.setup_combined_index")
 @patch("squidpy_rag.ChatOpenAI")
-def test_execute_rejects_h5ad_loader_on_zarr_path(
+def test_execute_rejects_code_that_reloads_preloaded_data(
     mock_chat_openai, mock_setup_index, mock_get_repl, mock_get_tool_config
 ):
     mock_get_tool_config.return_value = _mock_tool_config(rag_exec_enabled=True)
@@ -461,7 +558,7 @@ def test_execute_rejects_h5ad_loader_on_zarr_path(
     _setup_structured_llm(
         mock_llm,
         generated=GeneratedAnswer(
-            code="import squidpy as sq\nadata = sq.read_h5ad(DATA_PATH)\nprint(adata)",
+            code="import squidpy as sq\nsdata = sq.read_zarr(DATA_PATH)\nprint(sdata)",
             explanation="Load the data",
         ),
     )
@@ -476,6 +573,7 @@ def test_execute_rejects_h5ad_loader_on_zarr_path(
     mock_repl.run.assert_not_called()
     assert result["execution_success"] is False
     assert "Execution rejected" in result["execution_output"]
+    assert "already loaded as `sdata`" in result["execution_output"]
 
 
 @patch("squidpy_rag.get_tool_config")
@@ -501,8 +599,8 @@ def test_generate_answers_original_question_after_rewrite(
     _, mock_generator = _setup_structured_llm(
         mock_llm,
         generated=GeneratedAnswer(
-            code="import spatialdata as sd; print(sd.read_zarr(DATA_PATH))",
-            explanation="Load zarr",
+            code="print(list(sdata.tables))",
+            explanation="List the tables",
         ),
     )
     mock_llm.invoke.return_value = MagicMock(content="how to implement a timeout decorator")
