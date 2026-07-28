@@ -33,6 +33,8 @@ _python_repl = None
 
 class SquidpyRAGState(TypedDict):
     query: str
+    original_query: str
+    previous_queries: List[str]
     context: List[Document]
     filtered_context: List[Document]
     answer: str
@@ -63,6 +65,11 @@ def _max_rewrite_attempts() -> int:
     return get_tool_config().rag_max_rewrite_attempts
 
 
+def _resolve_question(state: "SquidpyRAGState") -> str:
+    """The user's actual question, which query rewrites must never replace."""
+    return state.get("original_query") or state["query"]
+
+
 def decide_relevance(state: SquidpyRAGState) -> Literal["generate", "rewrite_query"]:
     if state["filtered_context"] or state["rewrite_attempts"] >= _max_rewrite_attempts():
         return "generate"
@@ -86,6 +93,7 @@ def _execution_failed(output: str) -> bool:
         "External execution error",
         "exit_code=",
         "Execution skipped:",
+        "Execution rejected:",
         "No code was generated",
     )
     if output.startswith(
@@ -236,11 +244,13 @@ class SquidpyRAGTool:
                 "system",
                 "You are a query rewriter for a Squidpy and SpatialData code RAG system. "
                 "Rewrite the user's query to be more specific and retrievable from a Python "
-                "codebase index. Output only the rewritten query, nothing else.",
+                "codebase index. Keep the same topic, dataset and intent as the original "
+                "query: never substitute a different subject. Do not answer the query. "
+                "Output only the rewritten query, nothing else.",
             ),
             (
                 "user",
-                "Original query: {query}\n\n{execution_feedback}Rewritten query:",
+                "Original query: {query}\n\n{previous_attempts}Rewritten query:",
             ),
         ])
         rewriter = rewrite_prompt | llm
@@ -271,6 +281,15 @@ class SquidpyRAGTool:
             chat_history = state["chat_history"]
             data_path = state.get("data_path", "")
 
+            error_feedback = ""
+            if state.get("execution_output") and not state.get("execution_success", True):
+                error_feedback = (
+                    "A previous attempt at this same question failed when executed:\n"
+                    f"{state['execution_output']}\n"
+                    "Fix the cause of that failure. Keep answering the same question; "
+                    "do not switch topic to the error itself.\n\n"
+                )
+
             data_path_instruction = (
                 "No data path was provided. Keep the code example minimal and self-contained."
             )
@@ -300,8 +319,16 @@ class SquidpyRAGTool:
                     "- code: executable Python only (no markdown fences, no prose)\n"
                     "- explanation: concise explanation of the code\n\n"
                     "REMEMBER to specify shape = None for STARmap spatial transcriptomic data.\n"
-                    "The code must be runnable as-is in a Python REPL.\n"
+                    "The code must be runnable as-is in a Python REPL.\n\n"
+                    "CODE RULES:\n"
+                    "- Answer only the user question; never substitute an unrelated example.\n"
+                    "- Do NOT write timeout, retry, signal, threading or multiprocessing "
+                    "scaffolding; the execution harness already enforces a timeout.\n"
+                    "- Call every function you define; never leave the result as an "
+                    "uncalled function object.\n"
+                    "- Print the values the user asked for.\n\n"
                     "{data_path_instruction}\n\n"
+                    "{error_feedback}"
                     "Additional instructions:\n{spatial_processing_prompt}\n\n"
                     "CONTEXT FROM CODEBASE:\n{context_content}\n\n",
                 ),
@@ -309,11 +336,12 @@ class SquidpyRAGTool:
             ])
 
             messages = prompt.invoke({
-                "query": state["query"],
+                "query": _resolve_question(state),
                 "chat_history": chat_history,
                 "context_content": context_content,
                 "spatial_processing_prompt": spatial_processing_prompt,
                 "data_path_instruction": data_path_instruction,
+                "error_feedback": error_feedback,
             })
             result = generator_llm.invoke(messages)
             return {
@@ -329,7 +357,9 @@ class SquidpyRAGTool:
                     "execution_success": False,
                 }
 
-            if not state.get("data_path") and _code_requires_data(code):
+            data_path = state.get("data_path", "")
+
+            if not data_path and _code_requires_data(code):
                 return {
                     "execution_output": (
                         "Execution skipped: generated code references data files but no "
@@ -338,9 +368,19 @@ class SquidpyRAGTool:
                     "execution_success": False,
                 }
 
+            if data_path and "DATA_PATH" not in code:
+                return {
+                    "execution_output": (
+                        "Execution rejected: a data_path was provided but the generated code "
+                        "never uses DATA_PATH, so it does not answer the question about the "
+                        "dataset."
+                    ),
+                    "execution_success": False,
+                }
+
             tool_config = get_tool_config()
             timeout = tool_config.rag_exec_timeout
-            executable_code = _prepare_code_for_execution(code, state.get("data_path", ""))
+            executable_code = _prepare_code_for_execution(code, data_path)
             output = _get_python_repl().run(executable_code, timeout=timeout)
             success = not _execution_failed(output)
 
@@ -350,18 +390,22 @@ class SquidpyRAGTool:
             }
 
         def rewrite_query(state: SquidpyRAGState):
-            execution_feedback = ""
-            if state.get("execution_output") and not state.get("execution_success", True):
-                execution_feedback = (
-                    f"Previous code failed with:\n{state['execution_output']}\n\n"
+            previous = state.get("previous_queries") or []
+            previous_attempts = ""
+            if previous:
+                tried = "\n".join(f"- {q}" for q in previous)
+                previous_attempts = (
+                    "These rewrites were already tried and did not help:\n"
+                    f"{tried}\n\nProduce a different rewrite of the original query.\n\n"
                 )
             response = rewriter.invoke({
-                "query": state["query"],
-                "execution_feedback": execution_feedback,
+                "query": _resolve_question(state),
+                "previous_attempts": previous_attempts,
             })
             rewritten = response.content.strip()
             return {
                 "query": rewritten,
+                "previous_queries": previous + [rewritten],
                 "rewrite_attempts": state["rewrite_attempts"] + 1,
             }
 
@@ -407,6 +451,8 @@ class SquidpyRAGTool:
 
         response = self.rag_pipeline.invoke({
             "query": query,
+            "original_query": query,
+            "previous_queries": [],
             "chat_history": chat_history,
             "context": [],
             "filtered_context": [],

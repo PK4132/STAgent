@@ -16,12 +16,15 @@ from squidpy_rag import (
     _code_requires_data,
     _execution_failed,
     _prepare_code_for_execution,
+    _resolve_question,
 )
 
 
 def _base_state(**overrides):
     state = {
         "query": "test query",
+        "original_query": "test query",
+        "previous_queries": [],
         "context": [],
         "filtered_context": [],
         "answer": "",
@@ -108,6 +111,14 @@ def test_execution_failed_detects_traceback():
 def test_code_requires_data_heuristic():
     assert _code_requires_data("sdata = sd.read_zarr(DATA_PATH)") is True
     assert _code_requires_data("import squidpy as sq") is False
+
+
+def test_resolve_question_prefers_original_over_rewrite():
+    state = _base_state(
+        original_query="How do I read a zarr store?",
+        query="how to implement a timeout decorator",
+    )
+    assert _resolve_question(state) == "How do I read a zarr store?"
 
 
 def test_prepare_code_injects_data_path():
@@ -283,6 +294,90 @@ def test_execute_injects_data_path(
     mock_repl.run.assert_called_once_with(expected_code, timeout=30)
     assert result["execution_success"] is True
     assert result["execution_output"] == "loaded"
+
+
+@patch("squidpy_rag.get_tool_config")
+@patch("squidpy_rag._get_python_repl")
+@patch("squidpy_rag.SquidpyRAGTool.setup_combined_index")
+@patch("squidpy_rag.ChatOpenAI")
+def test_execute_rejects_code_ignoring_data_path(
+    mock_chat_openai, mock_setup_index, mock_get_repl, mock_get_tool_config
+):
+    mock_get_tool_config.return_value = _mock_tool_config(rag_exec_enabled=True)
+    mock_retriever = MagicMock()
+    mock_retriever.invoke.return_value = [
+        Document(page_content="read zarr", metadata={"source_repo": "spatialdata"}),
+    ]
+    mock_setup_index.return_value = mock_retriever
+
+    mock_repl = MagicMock()
+    mock_get_repl.return_value = mock_repl
+
+    mock_llm = MagicMock()
+    _setup_structured_llm(
+        mock_llm,
+        generated=GeneratedAnswer(
+            code="def timeout(f, seconds):\n    return f\nprint(timeout)",
+            explanation="A timeout decorator",
+        ),
+    )
+    mock_llm.invoke.return_value = MagicMock(content="rewritten query")
+    mock_chat_openai.return_value = mock_llm
+
+    tool = SquidpyRAGTool()
+    result = tool.rag_pipeline.invoke(
+        _base_state(data_path=r"C:\Pascal's Folders\QIMR\SCOPE_sample_40.zarr")
+    )
+
+    mock_repl.run.assert_not_called()
+    assert result["execution_success"] is False
+    assert "Execution rejected" in result["execution_output"]
+
+
+@patch("squidpy_rag.get_tool_config")
+@patch("squidpy_rag._get_python_repl")
+@patch("squidpy_rag.SquidpyRAGTool.setup_combined_index")
+@patch("squidpy_rag.ChatOpenAI")
+def test_generate_answers_original_question_after_rewrite(
+    mock_chat_openai, mock_setup_index, mock_get_repl, mock_get_tool_config
+):
+    """A failed execution must not let the rewriter change what is being answered."""
+    mock_get_tool_config.return_value = _mock_tool_config(rag_exec_enabled=True)
+    mock_retriever = MagicMock()
+    mock_retriever.invoke.return_value = [
+        Document(page_content="read zarr", metadata={"source_repo": "spatialdata"}),
+    ]
+    mock_setup_index.return_value = mock_retriever
+
+    mock_repl = MagicMock()
+    mock_repl.run.return_value = "Execution timed out"
+    mock_get_repl.return_value = mock_repl
+
+    mock_llm = MagicMock()
+    _, mock_generator = _setup_structured_llm(
+        mock_llm,
+        generated=GeneratedAnswer(
+            code="import spatialdata as sd; print(sd.read_zarr(DATA_PATH))",
+            explanation="Load zarr",
+        ),
+    )
+    mock_llm.invoke.return_value = MagicMock(content="how to implement a timeout decorator")
+    mock_chat_openai.return_value = mock_llm
+
+    tool = SquidpyRAGTool()
+    original = "Read the zarr SpatialData store and print element names"
+    tool.rag_pipeline.invoke(
+        _base_state(
+            query=original,
+            original_query=original,
+            data_path=r"C:\Pascal's Folders\QIMR\SCOPE_sample_40.zarr",
+        )
+    )
+
+    for call in mock_generator.invoke.call_args_list:
+        rendered = str(call.args[0])
+        assert original in rendered
+        assert "timeout decorator" not in rendered
 
 
 @patch("squidpy_rag.get_tool_config")
