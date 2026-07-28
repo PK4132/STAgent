@@ -56,7 +56,6 @@ Brings together analysis results into a coherent biological story that can suppo
 - `environment.gpu.yml`: optional heavier environment for the external STAligner and Tangram workflows.
 - `conversation_histories/`, `research_reports/`, `output_report/`, `src/tmp/plots/`: runtime outputs generated during use.
 
-
 ## Installation
 
 Run all commands from the package root:
