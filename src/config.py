@@ -8,11 +8,18 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 # Get the base directory (src folder)
 BASE_DIR = Path(__file__).parent.resolve()
 PROJECT_ROOT = BASE_DIR.parent
 DATA_DIR = PROJECT_ROOT / "data"
 DB_DIR = PROJECT_ROOT / "db"
+
+# Must run before the config dataclasses are instantiated below, otherwise the
+# settings read from os.getenv() would never see values defined in src/.env.
+# Real environment variables still win over the file.
+load_dotenv(BASE_DIR / ".env")
 
 
 @dataclass
@@ -214,8 +221,10 @@ class ToolConfig:
     chunk_overlap: int = 200
     top_k_results: int = 5
 
-    # RAG execution settings
-    rag_exec_timeout: int = 30
+    # RAG execution settings.
+    # Generated code runs in a spawned interpreter that re-imports squidpy and
+    # spatialdata from scratch, which alone can take well over a minute.
+    rag_exec_timeout: int = 120
     rag_exec_enabled: bool = True
     rag_max_rewrite_attempts: int = 3
     
