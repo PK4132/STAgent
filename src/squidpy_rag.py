@@ -195,6 +195,35 @@ def _load_python_chunks(repo_path: str, source_repo: str) -> List[Document]:
     return chunks
 
 
+def _module_label(metadata: Dict[str, Any]) -> str:
+    """Turn a chunk's file path into the module path used to import its symbols.
+
+    Without this the model only sees the repo name and has to guess whether a
+    function lives in e.g. squidpy.gr or squidpy.tl.
+    """
+    repo = str(metadata.get("source_repo") or "unknown")
+    source = str(metadata.get("source") or "").replace("\\", "/")
+    if not source:
+        return repo
+
+    parts = source.split("/")
+    if "src" in parts:
+        parts = parts[parts.index("src") + 1 :]
+        if parts and parts[-1].endswith(".py"):
+            parts[-1] = parts[-1][: -len(".py")]
+            if parts[-1] == "__init__":
+                parts = parts[:-1]
+            if parts:
+                return ".".join(parts)
+    return f"{repo}: {source}"
+
+
+def _format_context(docs: List[Document]) -> str:
+    return "\n\n".join(
+        f"# from {_module_label(doc.metadata)}\n{doc.page_content}" for doc in docs
+    )
+
+
 def _format_run_response(response: Dict[str, Any]) -> str:
     parts = [response.get("answer") or ""]
     generated_code = response.get("generated_code", "")
@@ -308,10 +337,7 @@ class SquidpyRAGTool:
 
         def generate(state: SquidpyRAGState):
             docs = state["filtered_context"] or state["context"]
-            context_content = "\n\n".join(
-                f"[{doc.metadata.get('source_repo', 'unknown')}]\n{doc.page_content}"
-                for doc in docs
-            )
+            context_content = _format_context(docs)
             chat_history = state["chat_history"]
             data_path = state.get("data_path", "")
 
@@ -369,7 +395,13 @@ class SquidpyRAGTool:
                     "- Let exceptions propagate. Do NOT wrap the analysis in try/except "
                     "blocks that only print the error.\n"
                     "- If you create matplotlib figures in a loop, close each one with "
-                    "plt.close() to avoid exhausting memory.\n\n"
+                    "plt.close() to avoid exhausting memory.\n"
+                    "- Import the top-level package and call symbols fully qualified, e.g. "
+                    "`import squidpy as sq` then `sq.gr.spatial_neighbors(adata)`. Do NOT "
+                    "write `from squidpy.tl import spatial_neighbors` style imports.\n"
+                    "- Every context block below starts with `# from <module>` giving the "
+                    "real module path of that code. Use those paths to decide where a "
+                    "function lives; never guess a submodule name.\n\n"
                     "{data_path_instruction}\n\n"
                     "{error_feedback}"
                     "Additional instructions:\n{spatial_processing_prompt}\n\n"

@@ -16,6 +16,8 @@ from squidpy_rag import (
     _code_requires_data,
     _data_loader_hint,
     _execution_failed,
+    _format_context,
+    _module_label,
     _prepare_code_for_execution,
     _resolve_question,
     _wrong_loader_reason,
@@ -115,6 +117,62 @@ def test_code_requires_data_heuristic():
     assert _code_requires_data("import squidpy as sq") is False
 
 
+def test_module_label_resolves_import_path():
+    assert (
+        _module_label(
+            {
+                "source_repo": "squidpy",
+                "source": r"packages_available\squidpy\src\squidpy\gr\neighbors.py",
+            }
+        )
+        == "squidpy.gr.neighbors"
+    )
+    assert (
+        _module_label(
+            {
+                "source_repo": "squidpy",
+                "source": r"packages_available\squidpy\src\squidpy\gr\__init__.py",
+            }
+        )
+        == "squidpy.gr"
+    )
+    assert (
+        _module_label(
+            {
+                "source_repo": "spatialdata",
+                "source": r"packages_available\spatialdata\src\spatialdata\_io\io_zarr.py",
+            }
+        )
+        == "spatialdata._io.io_zarr"
+    )
+
+
+def test_module_label_falls_back_outside_src():
+    label = _module_label(
+        {
+            "source_repo": "squidpy",
+            "source": r"packages_available\squidpy\.scripts\ci\download_data.py",
+        }
+    )
+    assert label.startswith("squidpy: ")
+    assert _module_label({"source_repo": "squidpy"}) == "squidpy"
+
+
+def test_format_context_exposes_module_paths():
+    docs = [
+        Document(
+            page_content="def spatial_neighbors(adata): ...",
+            metadata={
+                "source_repo": "squidpy",
+                "source": r"packages_available\squidpy\src\squidpy\gr\_build.py",
+            },
+        )
+    ]
+    rendered = _format_context(docs)
+    assert "# from squidpy.gr._build" in rendered
+    assert "def spatial_neighbors" in rendered
+
+
 def test_data_loader_hint_matches_extension():
     assert "read_zarr" in _data_loader_hint(r"C:\data\sample.zarr")
     assert "read_h5ad" in _data_loader_hint(r"C:\data\sample.h5ad")
@@ -175,6 +233,37 @@ def test_grade_documents_populates_filtered_context(
 
     assert len(result["filtered_context"]) == 1
     assert result["filtered_context"][0].metadata["source_repo"] == "squidpy"
+
+
+@patch("squidpy_rag.get_tool_config")
+@patch("squidpy_rag.SquidpyRAGTool.setup_combined_index")
+@patch("squidpy_rag.ChatOpenAI")
+def test_generate_prompt_includes_module_paths(
+    mock_chat_openai, mock_setup_index, mock_get_tool_config
+):
+    """The model must be told which module a retrieved symbol lives in."""
+    mock_get_tool_config.return_value = _mock_tool_config(rag_exec_enabled=False)
+    mock_retriever = MagicMock()
+    mock_retriever.invoke.return_value = [
+        Document(
+            page_content="def spatial_neighbors(adata): ...",
+            metadata={
+                "source_repo": "squidpy",
+                "source": r"packages_available\squidpy\src\squidpy\gr\_build.py",
+            },
+        ),
+    ]
+    mock_setup_index.return_value = mock_retriever
+
+    mock_llm = MagicMock()
+    _, mock_generator = _setup_structured_llm(mock_llm)
+    mock_chat_openai.return_value = mock_llm
+
+    tool = SquidpyRAGTool()
+    tool.rag_pipeline.invoke(_base_state())
+
+    rendered = str(mock_generator.invoke.call_args.args[0])
+    assert "# from squidpy.gr._build" in rendered
 
 
 @patch("squidpy_rag.get_tool_config")
