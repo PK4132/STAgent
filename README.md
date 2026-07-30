@@ -117,6 +117,30 @@ Optional integrations:
 
 Important: Make sure your API accounts have sufficient balance or credits available, otherwise the agent may not function properly.
 
+## SpatialData/Squidpy Knowledge Index
+
+The `squidpy_rag_agent` tool answers from a Chroma index built out of the SpatialData and
+Squidpy source trees, which are cloned into `packages_available/` (gitignored) and checked
+out at the refs given by `RAG_SPATIALDATA_REF` and `RAG_SQUIDPY_REF`.
+
+Build or refresh it explicitly, from the repository root, with LM Studio running and an
+embedding model loaded:
+
+```bash
+python src/squidpy_rag.py --rebuild-index
+```
+
+Only repositories whose commit actually moved are re-embedded; add `--force` to redo
+everything. Embedding is the slow step, so expect this to take a while on a first run.
+
+Keep the indexed ref and the installed wheel on the same version. The index teaches the
+model an API while generated code runs against the installed package, so a mismatch
+produces `AttributeError`s that the self-correction loop cannot recover from. The tool
+prints a warning when it detects the two have drifted:
+
+```bash
+pip install "spatialdata==0.7.3"
+```
 
 ## Running the App
 
