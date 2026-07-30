@@ -1,4 +1,5 @@
 import sys
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -8,22 +9,65 @@ from langchain_core.documents import Document
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from squidpy_rag import (
+    CHUNK_OVERLAP,
+    CHUNK_SIZE,
     GeneratedAnswer,
     GradeDoc,
+    RETRIEVED_DOC_TYPES,
     RepoWeightedRetriever,
     SquidpyRAGTool,
+    build_combined_index,
     decide_execution,
     decide_relevance,
     _code_requires_data,
     _data_access_hint,
+    _doc_type_for_source,
     _execution_failed,
+    _format_api_index,
     _format_context,
+    _index_fingerprint,
     _module_label,
     _prepare_code_for_execution,
     _preloaded_binding,
+    _repo_filter,
     _resolve_question,
+    _stale_repos,
+    _unknown_api_symbols,
     _wrong_loader_reason,
 )
+
+
+# Mirrors the shape of spatialdata's real _LAZY_IMPORTS / _submodules surface.
+_FAKE_API_SURFACE = {
+    "version": "0.7.3",
+    "symbols": ("SpatialData", "aggregate", "bounding_box_query", "get_extent", "read_zarr"),
+    "submodules": ("datasets", "models", "transformations"),
+}
+_EMPTY_API_SURFACE = {"version": "", "symbols": (), "submodules": ()}
+
+
+@pytest.fixture(autouse=True)
+def _stub_installed_api_surface():
+    """Keep the suite away from the real spatialdata import, which is slow and may be a
+    different version than these tests describe."""
+    with patch("squidpy_rag._installed_api_surface", return_value=_FAKE_API_SURFACE):
+        yield
+
+
+def _fingerprint(**overrides):
+    base = {
+        "schema": 2,
+        "refs": {"squidpy": "", "spatialdata": "v0.7.3"},
+        "commits": {"squidpy": "aaaaaaaaaaaa", "spatialdata": "bbbbbbbbbbbb"},
+        "chunking": {"chunk_size": CHUNK_SIZE, "chunk_overlap": CHUNK_OVERLAP},
+        "embedding_model": "nomic-embed-text-v1.5",
+        "installed": {"squidpy": "1.6.5", "spatialdata": "0.7.3"},
+    }
+    base.update(overrides)
+    return base
+
+
+_REPOS = ("squidpy", "spatialdata")
 
 
 def _base_state(**overrides):
@@ -45,13 +89,36 @@ def _base_state(**overrides):
     return state
 
 
-def _mock_tool_config(*, rag_exec_enabled=True, rag_max_rewrite_attempts=3):
+def _mock_tool_config(
+    *,
+    rag_exec_enabled=True,
+    rag_max_rewrite_attempts=3,
+    rag_index_refresh="auto",
+):
     mock_config = MagicMock()
     mock_config.rag_exec_enabled = rag_exec_enabled
     mock_config.rag_exec_timeout = 30
     mock_config.rag_max_rewrite_attempts = rag_max_rewrite_attempts
     mock_config.max_output_length = 10000
+    mock_config.rag_index_refresh = rag_index_refresh
+    mock_config.rag_spatialdata_ref = "v0.7.3"
+    mock_config.rag_squidpy_ref = ""
     return mock_config
+
+
+@contextmanager
+def _stubbed_index_build(store_exists):
+    """Let build_combined_index's decisions be observed without git, Chroma or embeddings."""
+    with ExitStack() as stack:
+        stack.enter_context(patch("squidpy_rag._sync_repo", return_value="deadbeef1234"))
+        stack.enter_context(patch("squidpy_rag.os.path.exists", return_value=store_exists))
+        stack.enter_context(patch("squidpy_rag._read_index_manifest", return_value={}))
+        stack.enter_context(patch("squidpy_rag._get_lm_studio_embeddings"))
+        stack.enter_context(patch("squidpy_rag.Chroma"))
+        stack.enter_context(patch("squidpy_rag.RepoWeightedRetriever"))
+        stack.enter_context(patch("squidpy_rag._write_index_manifest"))
+        stack.enter_context(patch("squidpy_rag._print_index_summary"))
+        yield stack.enter_context(patch("squidpy_rag._reindex_repo"))
 
 
 def _setup_structured_llm(mock_llm, *, grade_results=None, generated=None):
@@ -232,10 +299,125 @@ def test_repo_weighted_retriever_splits_search_by_repo():
 
     primary_kwargs = store.as_retriever.call_args_list[0].kwargs["search_kwargs"]
     secondary_kwargs = store.as_retriever.call_args_list[1].kwargs["search_kwargs"]
-    assert primary_kwargs["filter"] == {"source_repo": "spatialdata"}
-    assert secondary_kwargs["filter"] == {"source_repo": "squidpy"}
+    assert primary_kwargs["filter"] == _repo_filter("spatialdata", RETRIEVED_DOC_TYPES)
+    assert secondary_kwargs["filter"] == _repo_filter("squidpy", RETRIEVED_DOC_TYPES)
     assert primary_kwargs["k"] > secondary_kwargs["k"]
     assert [doc.page_content for doc in docs] == ["spatialdata chunk", "squidpy chunk"]
+
+
+def test_repo_filter_uses_compound_form_and_excludes_tests():
+    """Chroma needs $and once two metadata fields are involved."""
+    where = _repo_filter("spatialdata", ("code", "docs"))
+    assert where == {
+        "$and": [
+            {"source_repo": {"$eq": "spatialdata"}},
+            {"doc_type": {"$in": ["code", "docs"]}},
+        ]
+    }
+    assert "test" not in RETRIEVED_DOC_TYPES
+
+
+def test_doc_type_for_source_separates_tests_from_library_code():
+    assert _doc_type_for_source(r"packages_available\spatialdata\src\spatialdata\_io\io_zarr.py") == "code"
+    assert _doc_type_for_source(r"packages_available\spatialdata\tests\core\test_query.py") == "test"
+
+
+def test_index_fingerprint_records_what_invalidates_the_index():
+    fingerprint = _index_fingerprint({"spatialdata": "abc123"}, {"spatialdata": "v0.7.3"})
+    assert fingerprint["commits"] == {"spatialdata": "abc123"}
+    assert fingerprint["refs"] == {"spatialdata": "v0.7.3"}
+    assert fingerprint["chunking"] == {
+        "chunk_size": CHUNK_SIZE,
+        "chunk_overlap": CHUNK_OVERLAP,
+    }
+    assert "embedding_model" in fingerprint
+    assert "spatialdata" in fingerprint["installed"]
+
+
+def test_stale_repos_rebuilds_everything_without_a_manifest():
+    assert _stale_repos({}, _fingerprint(), _REPOS) == list(_REPOS)
+
+
+def test_stale_repos_only_rebuilds_the_repo_that_moved():
+    """Re-embedding is the expensive step, so an untouched repo must be left alone."""
+    current = _fingerprint(commits={"squidpy": "aaaaaaaaaaaa", "spatialdata": "cccccccccccc"})
+    assert _stale_repos(_fingerprint(), current, _REPOS) == ["spatialdata"]
+
+
+def test_stale_repos_detects_a_repin_even_at_the_same_commit():
+    current = _fingerprint(refs={"squidpy": "", "spatialdata": "v0.7.2"})
+    assert _stale_repos(_fingerprint(), current, _REPOS) == ["spatialdata"]
+
+
+def test_stale_repos_rebuilds_all_when_every_vector_would_differ():
+    previous = _fingerprint()
+    assert _stale_repos(previous, _fingerprint(embedding_model="other-model"), _REPOS) == list(_REPOS)
+    assert _stale_repos(
+        previous,
+        _fingerprint(chunking={"chunk_size": 500, "chunk_overlap": 0}),
+        _REPOS,
+    ) == list(_REPOS)
+
+
+def test_stale_repos_ignores_installed_version_changes():
+    """Chunks come from the checkout, so upgrading a wheel alone does not invalidate them."""
+    current = _fingerprint(installed={"squidpy": "1.6.5", "spatialdata": "0.8.0"})
+    assert _stale_repos(_fingerprint(), current, _REPOS) == []
+
+
+@patch("squidpy_rag.get_tool_config")
+def test_build_index_never_still_creates_a_missing_index(mock_get_tool_config):
+    """Suppressing refreshes must not leave a brand new index empty."""
+    mock_get_tool_config.return_value = _mock_tool_config(rag_index_refresh="never")
+    with _stubbed_index_build(store_exists=False) as mock_reindex:
+        build_combined_index()
+    assert {call.args[1] for call in mock_reindex.call_args_list} == {"squidpy", "spatialdata"}
+
+
+@patch("squidpy_rag.get_tool_config")
+def test_build_index_never_leaves_an_existing_index_alone(mock_get_tool_config):
+    mock_get_tool_config.return_value = _mock_tool_config(rag_index_refresh="never")
+    with _stubbed_index_build(store_exists=True) as mock_reindex:
+        build_combined_index()
+    mock_reindex.assert_not_called()
+
+
+@patch("squidpy_rag.get_tool_config")
+def test_build_index_force_reembeds_everything(mock_get_tool_config):
+    mock_get_tool_config.return_value = _mock_tool_config()
+    with _stubbed_index_build(store_exists=True) as mock_reindex:
+        build_combined_index(refresh="force")
+    assert {call.args[1] for call in mock_reindex.call_args_list} == {"squidpy", "spatialdata"}
+
+
+def test_format_api_index_lists_the_installed_surface():
+    rendered = _format_api_index()
+    assert "0.7.3" in rendered
+    assert "sd.read_zarr" in rendered
+    assert "sd.bounding_box_query" in rendered
+    assert "sd.models" in rendered
+
+
+def test_format_api_index_is_empty_when_the_surface_is_unknown():
+    with patch("squidpy_rag._installed_api_surface", return_value=_EMPTY_API_SURFACE):
+        assert _format_api_index() == ""
+
+
+def test_unknown_api_symbols_flags_calls_the_package_does_not_have():
+    assert _unknown_api_symbols("sd.read_zarr(DATA_PATH)") == []
+    assert _unknown_api_symbols("sd.models.Image2DModel.parse(arr)") == []
+    assert _unknown_api_symbols("adata = sd.read_h5ad(DATA_PATH)") == ["read_h5ad"]
+    assert _unknown_api_symbols("spatialdata.spatial_neighbors(adata)") == ["spatial_neighbors"]
+
+
+def test_unknown_api_symbols_stays_silent_when_the_surface_is_unknown():
+    """A failed import must never turn into a false rejection."""
+    with patch("squidpy_rag._installed_api_surface", return_value=_EMPTY_API_SURFACE):
+        assert _unknown_api_symbols("sd.definitely_not_a_real_function()") == []
+
+
+def test_unknown_api_symbols_does_not_confuse_sdata_for_sd():
+    assert _unknown_api_symbols("print(list(sdata.tables))") == []
 
 
 def test_resolve_question_prefers_original_over_rewrite():
@@ -364,6 +546,71 @@ def test_generate_prompt_is_spatialdata_first(
     assert "ALREADY LOADED" in rendered
     assert "sdata.tables" in rendered
     assert "SPATIALDATA GUIDANCE" in rendered
+
+
+@patch("squidpy_rag.get_tool_config")
+@patch("squidpy_rag.SquidpyRAGTool.setup_combined_index")
+@patch("squidpy_rag.ChatOpenAI")
+def test_generate_prompt_includes_the_installed_api_index(
+    mock_chat_openai, mock_setup_index, mock_get_tool_config
+):
+    """The model gets an authoritative symbol list, not just retrieved chunks."""
+    mock_get_tool_config.return_value = _mock_tool_config(rag_exec_enabled=False)
+    mock_retriever = MagicMock()
+    mock_retriever.invoke.return_value = [
+        Document(page_content="def read_zarr(path): ...", metadata={"source_repo": "spatialdata"}),
+    ]
+    mock_setup_index.return_value = mock_retriever
+
+    mock_llm = MagicMock()
+    _, mock_generator = _setup_structured_llm(mock_llm)
+    mock_chat_openai.return_value = mock_llm
+
+    tool = SquidpyRAGTool()
+    tool.rag_pipeline.invoke(_base_state())
+
+    rendered = str(mock_generator.invoke.call_args.args[0])
+    assert "SPATIALDATA API INDEX" in rendered
+    assert "sd.read_zarr" in rendered
+
+
+@patch("squidpy_rag.get_tool_config")
+@patch("squidpy_rag._get_python_repl")
+@patch("squidpy_rag.SquidpyRAGTool.setup_combined_index")
+@patch("squidpy_rag.ChatOpenAI")
+def test_execute_rejects_symbols_missing_from_installed_package(
+    mock_chat_openai, mock_setup_index, mock_get_repl, mock_get_tool_config
+):
+    """Catch a hallucinated API before paying the execution timeout for it."""
+    mock_get_tool_config.return_value = _mock_tool_config(rag_exec_enabled=True)
+    mock_retriever = MagicMock()
+    mock_retriever.invoke.return_value = [
+        Document(page_content="neighbors", metadata={"source_repo": "spatialdata"}),
+    ]
+    mock_setup_index.return_value = mock_retriever
+
+    mock_repl = MagicMock()
+    mock_get_repl.return_value = mock_repl
+
+    mock_llm = MagicMock()
+    _setup_structured_llm(
+        mock_llm,
+        generated=GeneratedAnswer(
+            code="print(sd.spatial_neighbors(sdata))",
+            explanation="Build a spatial graph",
+        ),
+    )
+    mock_llm.invoke.return_value = MagicMock(content="rewritten query")
+    mock_chat_openai.return_value = mock_llm
+
+    tool = SquidpyRAGTool()
+    result = tool.rag_pipeline.invoke(
+        _base_state(data_path=r"C:\Pascal's Folders\QIMR\SCOPE_sample_40.zarr")
+    )
+
+    mock_repl.run.assert_not_called()
+    assert result["execution_success"] is False
+    assert "spatialdata.spatial_neighbors does not exist" in result["execution_output"]
 
 
 @patch("squidpy_rag.get_tool_config")
