@@ -227,7 +227,17 @@ class ToolConfig:
     rag_exec_timeout: int = 120
     rag_exec_enabled: bool = True
     rag_max_rewrite_attempts: int = 3
-    
+
+    # RAG index provenance. The vendored repos are checked out at these refs so the
+    # index is reproducible and can be kept in step with the installed wheels.
+    # An empty ref means "leave the clone on whatever it is already on".
+    rag_spatialdata_ref: str = "v0.7.3"
+    rag_squidpy_ref: str = ""
+    # auto  -> rebuild only the repos whose ref or commit changed
+    # never  -> warn about a stale index but keep serving it
+    # force  -> rebuild everything
+    rag_index_refresh: str = "auto"
+
     def __post_init__(self):
         """Initialize computed fields."""
         # Get API keys from environment
@@ -250,6 +260,18 @@ class ToolConfig:
                 self.rag_max_rewrite_attempts = int(rag_max_rewrite)
             except ValueError:
                 pass
+
+        spatialdata_ref = os.getenv("RAG_SPATIALDATA_REF")
+        if spatialdata_ref is not None:
+            self.rag_spatialdata_ref = spatialdata_ref.strip()
+
+        squidpy_ref = os.getenv("RAG_SQUIDPY_REF")
+        if squidpy_ref is not None:
+            self.rag_squidpy_ref = squidpy_ref.strip()
+
+        index_refresh = os.getenv("RAG_INDEX_REFRESH")
+        if index_refresh and index_refresh.lower() in {"auto", "never", "force"}:
+            self.rag_index_refresh = index_refresh.lower()
 
 
 # Global configuration instances
